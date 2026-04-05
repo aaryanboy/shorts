@@ -2,6 +2,7 @@ import os
 import pickle
 import flask
 from flask import Flask, redirect, request, url_for, jsonify
+import google.oauth2.credentials
 from google.auth.transport.requests import Request
 import google_auth_oauthlib.flow
 from googleapiclient.discovery import build
@@ -9,17 +10,20 @@ from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaFileUpload
 import tempfile
 import subprocess
-import shutil
+import imageio_ffmpeg
 import yt_dlp
 import json
-import re
+from moviepy import VideoFileClip
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 # ── Config ──────────────────────────────────────────────────────────
 app = Flask(__name__)
 app.secret_key = "shorts-automation-secret-key"
+app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
 
 # Allow HTTP for local dev (remove in production)
-os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"
+if os.environ.get("FLASK_ENV") == "development":
+    os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"
 
 SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
 CLIENT_SECRETS_FILE = "credentials.json"   # OAuth client secret from Google Cloud
@@ -30,12 +34,6 @@ TEMP_DIR = os.path.join(VIDEO_DIR, "temp")  # Folder for downloaded TikToks
 # Ensure directories exist
 os.makedirs(VIDEO_DIR, exist_ok=True)
 os.makedirs(TEMP_DIR, exist_ok=True)
-
-
-def clean_error_message(msg):
-    """Remove ANSI escape sequences (colors) from error messages."""
-    ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
-    return ansi_escape.sub('', msg).strip()
 
 
 # ── Helpers ─────────────────────────────────────────────────────────
@@ -69,109 +67,96 @@ def get_youtube_client(creds):
     return build("youtube", "v3", credentials=creds)
 
 
-def get_ffmpeg_exe():
-    """Find ffmpeg executable from system PATH."""
-    ffmpeg = shutil.which("ffmpeg")
-    if ffmpeg:
-        return ffmpeg
-    # Fallback: try imageio_ffmpeg if installed
+def get_flow(state=None):
+    """Dynamically build the OAuth flow based on environment."""
+    client_id = os.environ.get("GOOGLE_CLIENT_ID")
+    client_secret = os.environ.get("GOOGLE_CLIENT_SECRET")
+    
+    if os.environ.get("FLASK_ENV") == "development":
+        redirect_uri = "http://localhost:5000/callback"
+    else:
+        redirect_uri = "https://god69851-shorts.hf.space/callback"
+
+    if client_id and client_secret:
+        client_config = {
+            "web": {
+                "client_id": client_id,
+                "project_id": "shorts-automation",
+                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                "token_uri": "https://oauth2.googleapis.com/token",
+                "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+                "client_secret": client_secret,
+                "redirect_uris": [redirect_uri]
+            }
+        }
+        flow = google_auth_oauthlib.flow.Flow.from_client_config(
+            client_config, scopes=SCOPES, state=state
+        )
+    else:
+        # Fallback to local secrets file
+        flow = google_auth_oauthlib.flow.Flow.from_client_secrets_file(
+            CLIENT_SECRETS_FILE, scopes=SCOPES, state=state
+        )
+    
+    flow.redirect_uri = redirect_uri
+    return flow
+
+
+def trim_video_for_shorts(video_path, max_duration=178.0):
+    """
+    Checks the video duration and aspect ratio. 
+    If duration is over limits or aspect ratio isn't 9:16, it correctly 
+    trims/pads via FFmpeg and saves to a temporary file. Returns the path 
+    to the file to upload and a boolean indicating if it's a temp file.
+    """
     try:
-        import imageio_ffmpeg
-        return imageio_ffmpeg.get_ffmpeg_exe()
-    except ImportError:
-        return "ffmpeg"  # Hope it's on PATH
-
-
-def get_ffprobe_exe():
-    """Find ffprobe executable from system PATH."""
-    ffprobe = shutil.which("ffprobe")
-    if ffprobe:
-        return ffprobe
-    # Derive from ffmpeg path
-    ffmpeg = get_ffmpeg_exe()
-    ffprobe_path = ffmpeg.replace("ffmpeg", "ffprobe")
-    if os.path.exists(ffprobe_path):
-        return ffprobe_path
-    return "ffprobe"
-
-
-def probe_video(video_path):
-    """Use ffprobe to get video duration and dimensions. Returns (duration, width, height)."""
-    try:
-        cmd = [
-            get_ffprobe_exe(),
-            "-v", "quiet",
-            "-print_format", "json",
-            "-show_entries", "format=duration:stream=width,height",
-            video_path
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        data = json.loads(result.stdout)
+        clip = VideoFileClip(video_path)
+        duration = clip.duration
+        w, h = clip.size
+        clip.close()
         
-        duration = float(data["format"]["duration"])
-        # Find the video stream with width/height
-        w, h = 0, 0
-        for stream in data.get("streams", []):
-            if "width" in stream and "height" in stream:
-                w = int(stream["width"])
-                h = int(stream["height"])
-                break
-        return duration, w, h
-    except Exception as e:
-        print(f"  ffprobe failed: {e}")
-        return None, 0, 0
-
-
-def trim_video_for_shorts(video_path, max_duration=178.0, duration=None, width=None, height=None):
-    """
-    Checks the video duration and aspect ratio.
-    If duration/width/height are provided (e.g. from yt-dlp), uses those directly.
-    Otherwise falls back to ffprobe. Trims/pads via FFmpeg if needed.
-    Returns (path_to_upload, is_temp_file).
-    """
-    try:
-        # Use provided metadata or fall back to ffprobe
-        if duration is None or width is None or height is None:
-            duration, width, height = probe_video(video_path)
-            if duration is None:
-                print("  Could not read video metadata, uploading as-is.")
-                return video_path, False
-
-        aspect_ratio = width / height if height > 0 else 1
+        aspect_ratio = w / h
+        # Ideal Shorts ratio is 9:16 (0.5625). If it's too wide (>0.6) or too skinny (<0.5), pad it.
         needs_padding = abs(aspect_ratio - (9/16)) > 0.05
 
         if duration > max_duration or needs_padding:
+            # Create a temporary file for the output
             temp_fd, temp_path = tempfile.mkstemp(suffix=".mp4")
             os.close(temp_fd)
-
-            ffmpeg_exe = get_ffmpeg_exe()
+            
+            ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
             cmd = [ffmpeg_exe, "-y", "-i", video_path]
-
+            
+            # Trim duration
             if duration > max_duration:
                 cmd.extend(["-t", str(max_duration)])
-
+            
+            # Pad / aspect ratio correction
             if needs_padding:
-                print(f"  Video is {width}x{height} (not 9:16). Encoding with black bars...")
+                print(f"  Video is {w}x{h} (not 9:16). Encoding with black bars...")
                 cmd.extend([
                     "-vf", "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2,setsar=1",
                     "-c:v", "libx264", "-preset", "fast", "-crf", "23",
                     "-c:a", "aac"
                 ])
             else:
-                print(f"  Video is {duration:.1f}s. Stream-copying first {max_duration}s...")
+                print(f"  Video is {duration:.1f}s. Instantly stream-copying first {max_duration}s via FFmpeg...")
                 cmd.extend(["-c", "copy"])
-
+                
             cmd.append(temp_path)
+            
+            # Execute ffmpeg
             subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            
             return temp_path, True
-
+        
         return video_path, False
     except Exception as e:
         print(f"  Error processing video with FFmpeg: {e}")
         return video_path, False
 
 
-def upload_video(youtube, video_path, title="", description="", tags=None, privacy="public"):
+def upload_video(youtube, video_path, title="", description="", tags=None, privacy="private"):
     """Upload a single video to YouTube as a Short."""
     if not os.path.isfile(video_path):
         return {"error": f"File not found: {video_path}"}
@@ -226,7 +211,6 @@ def index():
     creds = load_credentials()
     logged_in = creds is not None and creds.valid
     success = request.args.get("success")
-    error = request.args.get("error")
     
     return f"""
     <!DOCTYPE html>
@@ -354,17 +338,10 @@ def index():
             }}
             @keyframes slideIn {{ to {{ transform: translateX(0); }} }}
             @keyframes slideOut {{ to {{ transform: translateX(120%); }} }}
-
-            .toast.error {{
-                background: rgba(255, 71, 87, 0.15);
-                border: 1px solid #ff4757;
-                color: #ff4757;
-            }}
         </style>
     </head>
     <body>
         { '<div class="toast">✅ Successfully uploaded </div>' if success else '' }
-        { f'<div class="toast error">❌ {error}</div>' if error else '' }
 
         <div id="loader-overlay">
             <div class="spinner"></div>
@@ -397,10 +374,7 @@ def index():
 
 @app.route("/login")
 def login():
-    flow = google_auth_oauthlib.flow.Flow.from_client_secrets_file(
-        CLIENT_SECRETS_FILE, scopes=SCOPES
-    )
-    flow.redirect_uri = url_for("callback", _external=True)
+    flow = get_flow()
 
     auth_url, state = flow.authorization_url(
         access_type="offline",       # Get refresh token
@@ -417,10 +391,7 @@ def login():
 @app.route("/callback")
 def callback():
     state = flask.session.get("state")
-    flow = google_auth_oauthlib.flow.Flow.from_client_secrets_file(
-        CLIENT_SECRETS_FILE, scopes=SCOPES, state=state
-    )
-    flow.redirect_uri = url_for("callback", _external=True)
+    flow = get_flow(state=state)
 
     # Restore PKCE code verifier from session
     flow.code_verifier = flask.session.get("code_verifier")
@@ -444,7 +415,7 @@ def logout():
 def download_tiktok():
     target_url = request.form.get("url")
     if not target_url:
-        return redirect(url_for("index", error="No URL provided"))
+        return jsonify({"error": "No URL provided"})
 
     ydl_opts = {
         'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
@@ -452,6 +423,7 @@ def download_tiktok():
         'merge_output_format': 'mp4',
         'quiet': True,
         'no_warnings': True,
+        'writeinfojson': True, # This saves the metadata to a .info.json file!
     }
 
     try:
@@ -459,27 +431,11 @@ def download_tiktok():
             print(f"Downloading TikTok: {target_url}")
             info = ydl.extract_info(target_url, download=True)
             filename = ydl.prepare_filename(info)
-
-            # Grab everything from yt-dlp's info dict directly — no .info.json needed
-            raw_title = info.get("title", "")
-            yt_title = (raw_title[:90] + "...") if len(raw_title) > 95 else raw_title
-            if not yt_title:
-                yt_title = "TikTok Video"
-
-            flask.session["dl_meta"] = {
-                "file": filename,
-                "duration": info.get("duration"),
-                "width": info.get("width"),
-                "height": info.get("height"),
-                "title": yt_title,
-                "description": info.get("description", raw_title),
-                "tags": info.get("tags", []),
-            }
-
+            
+            # Immediately trigger the upload process so it's a 1-click operation
             return redirect(url_for("upload"))
     except Exception as e:
-        error_msg = clean_error_message(str(e))
-        return redirect(url_for("index", error=error_msg))
+        return jsonify({"error": str(e)})
 
 
 @app.route("/upload")
@@ -489,80 +445,98 @@ def upload():
         return redirect(url_for("login"))
 
     youtube = get_youtube_client(creds)
-    dl_meta = flask.session.pop("dl_meta", None)
 
-    # ── Path A: Single file from TikTok download (metadata already in session) ──
-    if dl_meta and dl_meta.get("file") and os.path.isfile(dl_meta["file"]):
-        original_path = dl_meta["file"]
-        print(f"Processing: {os.path.basename(original_path)}")
-
-        upload_path, is_temp = trim_video_for_shorts(
-            original_path,
-            duration=dl_meta.get("duration"),
-            width=dl_meta.get("width"),
-            height=dl_meta.get("height"),
-        )
-
-        try:
-            upload_video(
-                youtube, upload_path,
-                title=dl_meta.get("title", "TikTok Video"),
-                description=dl_meta.get("description", ""),
-                tags=dl_meta.get("tags", []),
-            )
-        except HttpError as e:
-            error_msg = clean_error_message(str(e))
-            return redirect(url_for("index", error=error_msg))
-        finally:
-            # Clean up temp trimmed file
-            if is_temp and os.path.exists(upload_path):
-                os.remove(upload_path)
-            # Clean up downloaded file
-            if os.path.exists(original_path):
-                os.remove(original_path)
-
-        return redirect(url_for("index", success=1))
-
-    # ── Path B: Manual uploads — scan videos/ folder ──
-    videos_to_upload = [
-        os.path.join(VIDEO_DIR, f)
-        for f in os.listdir(VIDEO_DIR)
-        if f.lower().endswith(".mp4") and os.path.isfile(os.path.join(VIDEO_DIR, f))
-    ] if os.path.isdir(VIDEO_DIR) else []
+    # Find all .mp4 files in the videos/ folder and videos/temp/ folder
+    videos_to_upload = []
+    
+    if os.path.isdir(VIDEO_DIR):
+        for f in os.listdir(VIDEO_DIR):
+            if f.lower().endswith(".mp4") and os.path.isfile(os.path.join(VIDEO_DIR, f)):
+                videos_to_upload.append(os.path.join(VIDEO_DIR, f))
+                
+    if os.path.isdir(TEMP_DIR):
+        for f in os.listdir(TEMP_DIR):
+            if f.lower().endswith(".mp4") and os.path.isfile(os.path.join(TEMP_DIR, f)):
+                videos_to_upload.append(os.path.join(TEMP_DIR, f))
 
     if not videos_to_upload:
-        error_msg = f"No .mp4 files found in '{VIDEO_DIR}/'. For TikTok, use the home page form."
-        return redirect(url_for("index", error=error_msg))
+        return jsonify({"error": f"No .mp4 files found in '{VIDEO_DIR}/' or '{TEMP_DIR}/'."})
 
     results = []
     for original_path in videos_to_upload:
         vid = os.path.basename(original_path)
         print(f"Processing: {vid}")
-
-        # Use filename as title for manual uploads
+        
+        # Default metadata
         yt_title = os.path.splitext(vid)[0]
+        yt_desc = ""
+        yt_tags = []
+        
+        # Look for the metadata JSON file created by yt-dlp
+        base_name = os.path.splitext(original_path)[0]
+        json_path = base_name + ".info.json"
+        
+        if os.path.exists(json_path):
+            with open(json_path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+                
+                # Fetch data from TikTok
+                raw_title = meta.get("title", "")
+                yt_desc = meta.get("description", raw_title)
+                yt_tags = meta.get("tags", [])
+                    
+                # YouTube limits titles to 100 characters. We'll trim at 90.
+                yt_title = (raw_title[:90] + "...") if len(raw_title) > 95 else raw_title
+                if not yt_title:
+                    yt_title = "TikTok Video"
+        
+        # Trim video if necessary
         upload_path, is_temp = trim_video_for_shorts(original_path)
-
+        
+        upload_success = False
         try:
-            result = upload_video(youtube, upload_path, title=yt_title)
-            results.append({"file": vid, **result})
+            result = upload_video(
+                youtube, 
+                upload_path, 
+                title=yt_title,
+                description=yt_desc,
+                tags=yt_tags
+            )
+            results.append({"file": vid, "trimmed": is_temp, **result})
+            upload_success = True
         except HttpError as e:
             results.append({"file": vid, "error": str(e)})
-        finally:
-            if is_temp and os.path.exists(upload_path):
+            
+        # 1. ALWAYS clean up the ffmpeg trimmed file if created
+        if is_temp and os.path.exists(upload_path):
+            try:
                 os.remove(upload_path)
+            except OSError:
+                pass
+        
+        # 2. If the video posted successfully AND it was a TikTok download (in TEMP_DIR), delete the raw file and JSON
+        if upload_success and TEMP_DIR in original_path:
+            if os.path.exists(json_path):
+                try:
+                    os.remove(json_path)
+                except OSError:
+                    pass
+            if os.path.exists(original_path):
+                try:
+                    os.remove(original_path)
+                except OSError:
+                    pass
 
+    # Return a redirect back to the home page with a success flag
     if any("error" not in r for r in results):
         return redirect(url_for("index", success=1))
     
-    # If everything failed, collect errors and redirect
-    combined_errors = " | ".join([clean_error_message(r["error"]) for r in results if "error" in r])
-    return redirect(url_for("index", error=combined_errors or "Upload failed"))
+    # If everything failed, just return the raw errors
+    return jsonify({"errors": results})
 
 
 # ── Main ────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
     print("YouTube Shorts Auto-Upload Bot")
-    print(f"Server starting on http://0.0.0.0:{port}")
-    app.run("0.0.0.0", port=port, debug=True)
+    print(f"Place .mp4 files in '{VIDEO_DIR}/' and visit http://localhost:5000")
+    app.run("localhost", 5000, debug=True)
