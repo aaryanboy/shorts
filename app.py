@@ -18,7 +18,7 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 
 # ── Config ──────────────────────────────────────────────────────────
 app = Flask(__name__)
-app.secret_key = "shorts-automation-secret-key"
+app.secret_key = os.environ.get("FLASK_SECRET_KEY", "shorts-automation-secret-key")
 app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
 
 # Allow HTTP for local dev (remove in production)
@@ -538,5 +538,7 @@ def upload():
 # ── Main ────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     print("YouTube Shorts Auto-Upload Bot")
-    print(f"Place .mp4 files in '{VIDEO_DIR}/' and visit http://localhost:5000")
-    app.run("localhost", 5000, debug=True)
+    if os.environ.get("FLASK_ENV") == "development":
+        app.run(host="localhost", port=5000, debug=True)
+    else:
+        app.run(host="0.0.0.0", port=7860)
