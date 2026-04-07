@@ -15,17 +15,23 @@ import yt_dlp
 import json
 import re
 from werkzeug.middleware.proxy_fix import ProxyFix
+from datetime import timedelta
 
 # ── Config ──────────────────────────────────────────────────────────
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", "shorts-automation-secret-key")
+app.permanent_session_lifetime = timedelta(days=30)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
 
 # Allow HTTP for local dev (remove in production)
 if os.environ.get("FLASK_ENV") == "development":
     os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"
 
-SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
+SCOPES = [
+    "https://www.googleapis.com/auth/youtube.upload",
+    "https://www.googleapis.com/auth/userinfo.profile",
+    "https://www.googleapis.com/auth/userinfo.email"
+]
 CLIENT_SECRETS_FILE = "credentials.json"   # OAuth client secret from Google Cloud
 
 VIDEO_DIR = "videos"                        # Folder containing .mp4 files
@@ -36,12 +42,19 @@ os.makedirs(VIDEO_DIR, exist_ok=True)
 os.makedirs(TEMP_DIR, exist_ok=True)
 
 
-def load_credentials():
-    """Load saved credentials from flask session. Returns None if not found or invalid."""
-    if 'credentials' not in flask.session:
+def get_accounts():
+    accounts = flask.session.get('accounts', {})
+    if not isinstance(accounts, dict):
+        accounts = {}
+    return accounts
+
+def load_credentials(email):
+    """Load saved credentials from flask session for a specific email."""
+    accounts = get_accounts()
+    if email not in accounts:
         return None
 
-    creds_data = flask.session['credentials']
+    creds_data = accounts[email]
     creds = google.oauth2.credentials.Credentials(
         token=creds_data.get('token'),
         refresh_token=creds_data.get('refresh_token'),
@@ -55,23 +68,13 @@ def load_credentials():
     if creds and creds.expired and creds.refresh_token:
         try:
             creds.refresh(Request())
-            save_credentials(creds)
+            accounts[email]['token'] = creds.token
+            flask.session['accounts'] = accounts
+            flask.session.modified = True
         except Exception:
             return None
 
     return creds
-
-
-def save_credentials(creds):
-    """Persist credentials to flask session for multi-user isolation."""
-    flask.session['credentials'] = {
-        'token': creds.token,
-        'refresh_token': creds.refresh_token,
-        'token_uri': creds.token_uri,
-        'client_id': creds.client_id,
-        'client_secret': creds.client_secret,
-        'scopes': creds.scopes
-    }
 
 
 def get_youtube_client(creds):
@@ -240,9 +243,32 @@ def upload_video(youtube, video_path, title="", description="", tags=None, priva
 # ── Routes ──────────────────────────────────────────────────────────
 @app.route("/")
 def index():
-    creds = load_credentials()
-    logged_in = creds is not None and creds.valid
+    accounts = get_accounts()
+    logged_in = len(accounts) > 0
     success = request.args.get("success")
+    
+    accounts_html = ""
+    for email, acc in accounts.items():
+        pic = acc.get('picture', '')
+        name = acc.get('name', email)
+        accounts_html += f"""
+        <div style="display:flex; align-items:center; justify-content:space-between; background:rgba(255,255,255,0.03); border:1px solid rgba(255,255,255,0.1); padding:12px; border-radius:16px; margin-bottom:12px;">
+            <div style="display:flex; align-items:center;">
+                <img src="{pic}" style="width:36px; height:36px; border-radius:50%; border:2px solid var(--primary);">
+                <div style="margin-left:12px; text-align:left;">
+                    <div style="font-weight:600; font-size:14px; color:white;">{name}</div>
+                    <div style="font-size:11px; color:rgba(255,255,255,0.5);">{email}</div>
+                </div>
+            </div>
+            <div style="display:flex; align-items:center; gap: 16px;">
+                <label class="switch" style="position:relative; display:inline-block; width:44px; height:24px;">
+                    <input type="checkbox" name="target_emails" value="{email}" checked style="opacity:0; width:0; height:0;">
+                    <span class="slider round" style="position:absolute; cursor:pointer; top:0; left:0; right:0; bottom:0; background-color:rgba(255,255,255,0.1); transition:.4s; border-radius:24px;"></span>
+                </label>
+                <a href="/logout?email={email}" style="color:#f22a5c; font-size:24px; text-decoration:none; line-height:1;" title="Logout">×</a>
+            </div>
+        </div>
+        """
     
     return f"""
     <!DOCTYPE html>
@@ -370,6 +396,11 @@ def index():
             }}
             @keyframes slideIn {{ to {{ transform: translateX(0); }} }}
             @keyframes slideOut {{ to {{ transform: translateX(120%); }} }}
+            
+            .switch input:checked + .slider {{ background-color: var(--primary); }}
+            .switch input:focus + .slider {{ box-shadow: 0 0 1px var(--primary); }}
+            .switch input:checked + .slider:before {{ transform: translateX(20px); }}
+            .slider:before {{ position:absolute; content:""; height:18px; width:18px; left:3px; bottom:3px; background-color:white; transition:.4s; border-radius:50%; }}
         </style>
     </head>
     <body>
@@ -385,16 +416,20 @@ def index():
 
         <div class="card">
             <h1>Shorts Bot</h1>
-            <p class="status">● {"Authenticated" if logged_in else "Not authenticated"}</p>
-            
+            <p class="status">● {f"{len(accounts)} Account(s) Authenticated" if logged_in else "Not authenticated"}</p>
             {f'''
             <form action="/tiktok" method="POST" onsubmit="document.getElementById('loader-overlay').style.display='flex'">
-                <div style="display:flex; gap:8px; margin-bottom:20px;">
+                <div style="display:flex; gap:8px; margin-bottom:15px;">
                     <input type="url" class="input-field" id="url-input" name="url" placeholder="Paste TikTok URL..." required autocomplete="off" style="margin-bottom:0;">
                     <button type="button" onclick="navigator.clipboard.readText().then(t=>document.getElementById('url-input').value=t)" style="background:var(--border-color); border:1px solid var(--border-color); color:white; border-radius:12px; padding:0 16px; cursor:pointer; font-size:18px; white-space:nowrap;" title="Paste">📋</button>
                 </div>
+                <div style="margin-bottom: 24px; text-align: center;">
+                    <label style="font-size: 14px; color: var(--text-muted); margin-bottom: 12px; display: block;">Select Channels to Upload</label>
+                    {accounts_html}
+                </div>
                 <button type="submit" class="btn">Post</button>
             </form>
+            <a href='/login' target='_blank' class='btn btn-login' style='margin-top: 20px; background: #2B2C30; border: 1px solid var(--border-color);'>+ Add another account</a>
             ''' if logged_in else "<a href='/login' target='_blank' class='btn btn-login'>Login with Google</a>"}
             
             { "<a href='/logout' class='logout-link'>Sign Out</a>" if logged_in else "" }
@@ -431,20 +466,52 @@ def callback():
     # Exchange auth code for credentials
     flow.fetch_token(authorization_response=request.url)
     creds = flow.credentials
-    save_credentials(creds)
+
+    try:
+        oauth2_client = build('oauth2', 'v2', credentials=creds)
+        user_info = oauth2_client.userinfo().get().execute()
+        email = user_info.get('email')
+        
+        accounts = get_accounts()
+        flask.session.permanent = True
+        accounts[email] = {
+            'email': email,
+            'name': user_info.get('name'),
+            'picture': user_info.get('picture'),
+            'token': creds.token,
+            'refresh_token': creds.refresh_token,
+            'token_uri': creds.token_uri,
+            'client_id': creds.client_id,
+            'client_secret': creds.client_secret,
+            'scopes': creds.scopes
+        }
+        flask.session['accounts'] = accounts
+        flask.session.modified = True
+    except Exception as e:
+        print(f"Failed to fetch user profile: {e}")
 
     return redirect(url_for("index"))
 
 
 @app.route("/logout")
 def logout():
-    flask.session.pop('credentials', None)
+    email = request.args.get('email')
+    accounts = get_accounts()
+    if email and email in accounts:
+        del accounts[email]
+        flask.session['accounts'] = accounts
+        flask.session.modified = True
+    else:
+        flask.session.pop('accounts', None)
+        
     return redirect(url_for("index"))
 
 
 @app.route("/tiktok", methods=["POST"])
 def download_tiktok():
     target_url = request.form.get("url")
+    target_emails = request.form.getlist("target_emails")
+    
     if not target_url:
         return jsonify({"error": "No URL provided"})
 
@@ -454,28 +521,38 @@ def download_tiktok():
         'merge_output_format': 'mp4',
         'quiet': True,
         'no_warnings': True,
-        'writeinfojson': True, # This saves the metadata to a .info.json file!
+        'writeinfojson': True,
     }
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             print(f"Downloading TikTok: {target_url}")
             info = ydl.extract_info(target_url, download=True)
-            filename = ydl.prepare_filename(info)
             
-            # Immediately trigger the upload process so it's a 1-click operation
-            return redirect(url_for("upload"))
+            redir_url = url_for("upload") + "?" + "&".join([f"target_email={e}" for e in target_emails])
+            return redirect(redir_url)
     except Exception as e:
         return jsonify({"error": str(e)})
 
 
 @app.route("/upload")
 def upload():
-    creds = load_credentials()
-    if not creds or not creds.valid:
+    accounts = get_accounts()
+    if not accounts:
         return redirect(url_for("login"))
-
-    youtube = get_youtube_client(creds)
+        
+    target_emails = request.args.getlist("target_email")
+    
+    upload_clients = []
+    
+    for em in target_emails:
+        if em in accounts:
+            creds = load_credentials(em)
+            if creds and creds.valid:
+                upload_clients.append(get_youtube_client(creds))
+            
+    if not upload_clients:
+        return jsonify({"error": "Valid credentials not found for selected account(s). Please login again."})
 
     # Find all .mp4 files in the videos/ folder and videos/temp/ folder
     videos_to_upload = []
@@ -527,14 +604,15 @@ def upload():
         
         upload_success = False
         try:
-            result = upload_video(
-                youtube, 
-                upload_path, 
-                title=yt_title,
-                description=yt_desc,
-                tags=yt_tags
-            )
-            results.append({"file": vid, "trimmed": is_temp, **result})
+            for youtube in upload_clients:
+                result = upload_video(
+                    youtube, 
+                    upload_path, 
+                    title=yt_title,
+                    description=yt_desc,
+                    tags=yt_tags
+                )
+            results.append({"file": vid, "trimmed": is_temp, "success": True})
             upload_success = True
         except HttpError as e:
             results.append({"file": vid, "error": str(e)})
