@@ -14,79 +14,92 @@ import imageio_ffmpeg
 import yt_dlp
 import json
 import re
+import requests as http_requests
 from werkzeug.middleware.proxy_fix import ProxyFix
-from datetime import timedelta
 
 # ── Config ──────────────────────────────────────────────────────────
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", "shorts-automation-secret-key")
-app.permanent_session_lifetime = timedelta(days=30)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
 
-# Allow HTTP for local dev (remove in production)
 if os.environ.get("FLASK_ENV") == "development":
     os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"
 
 SCOPES = [
     "https://www.googleapis.com/auth/youtube.upload",
-    "https://www.googleapis.com/auth/userinfo.profile",
-    "https://www.googleapis.com/auth/userinfo.email"
+    "https://www.googleapis.com/auth/userinfo.email",
+    "openid"
 ]
-CLIENT_SECRETS_FILE = "credentials.json"   # OAuth client secret from Google Cloud
+CLIENT_SECRETS_FILE = "credentials.json"
+ACCOUNTS_FILE = "accounts.json"
+TOKENS_DIR = "tokens"
+VIDEO_DIR = "videos"
+TEMP_DIR = os.path.join(VIDEO_DIR, "temp")
 
-VIDEO_DIR = "videos"                        # Folder containing .mp4 files
-TEMP_DIR = os.path.join(VIDEO_DIR, "temp")  # Folder for downloaded TikToks
-
-# Ensure directories exist
 os.makedirs(VIDEO_DIR, exist_ok=True)
 os.makedirs(TEMP_DIR, exist_ok=True)
+os.makedirs(TOKENS_DIR, exist_ok=True)
 
 
-def get_accounts():
-    accounts = flask.session.get('accounts', {})
-    if not isinstance(accounts, dict):
-        accounts = {}
-    return accounts
+# ── Account Helpers ─────────────────────────────────────────────────
 
-def load_credentials(email):
-    """Load saved credentials from flask session for a specific email."""
-    accounts = get_accounts()
-    if email not in accounts:
+def load_accounts():
+    """Load the list of authenticated accounts from accounts.json."""
+    if not os.path.exists(ACCOUNTS_FILE):
+        return {}
+    with open(ACCOUNTS_FILE, "r") as f:
+        return json.load(f)
+
+def save_accounts(accounts):
+    with open(ACCOUNTS_FILE, "w") as f:
+        json.dump(accounts, f)
+
+def token_path(email):
+    safe = email.replace("@", "_at_").replace(".", "_")
+    return os.path.join(TOKENS_DIR, f"token_{safe}.pkl")
+
+def load_credentials_for(email):
+    path = token_path(email)
+    if not os.path.exists(path):
         return None
-
-    creds_data = accounts[email]
-    creds = google.oauth2.credentials.Credentials(
-        token=creds_data.get('token'),
-        refresh_token=creds_data.get('refresh_token'),
-        token_uri=creds_data.get('token_uri'),
-        client_id=creds_data.get('client_id'),
-        client_secret=creds_data.get('client_secret'),
-        scopes=creds_data.get('scopes')
-    )
-
-    # Refresh if expired
+    with open(path, "rb") as f:
+        creds = pickle.load(f)
     if creds and creds.expired and creds.refresh_token:
         try:
             creds.refresh(Request())
-            accounts[email]['token'] = creds.token
-            flask.session['accounts'] = accounts
-            flask.session.modified = True
+            save_credentials_for(creds, email)
         except Exception:
             return None
-
     return creds
 
+def save_credentials_for(creds, email):
+    with open(token_path(email), "wb") as f:
+        pickle.dump(creds, f)
+
+def get_email_from_creds(creds):
+    """Fetch the user's email using Google's userinfo API."""
+    try:
+        resp = http_requests.get(
+            "https://www.googleapis.com/oauth2/v2/userinfo",
+            headers={"Authorization": f"Bearer {creds.token}"}
+        )
+        return resp.json().get("email")
+    except Exception:
+        return None
+
+def get_active_account():
+    return flask.session.get("active_account")
 
 def get_youtube_client(creds):
-    """Build and return an authenticated YouTube API client."""
     return build("youtube", "v3", credentials=creds)
 
 
+# ── OAuth Flow ───────────────────────────────────────────────────────
+
 def get_flow(state=None):
-    """Dynamically build the OAuth flow based on environment."""
     client_id = os.environ.get("GOOGLE_CLIENT_ID")
     client_secret = os.environ.get("GOOGLE_CLIENT_SECRET")
-    
+
     if os.environ.get("FLASK_ENV") == "development":
         redirect_uri = "http://localhost:5000/callback"
     else:
@@ -108,95 +121,67 @@ def get_flow(state=None):
             client_config, scopes=SCOPES, state=state
         )
     else:
-        # Fallback to local secrets file
         flow = google_auth_oauthlib.flow.Flow.from_client_secrets_file(
             CLIENT_SECRETS_FILE, scopes=SCOPES, state=state
         )
-    
+
     flow.redirect_uri = redirect_uri
     return flow
 
 
+# ── Video Helpers ────────────────────────────────────────────────────
+
 def trim_video_for_shorts(video_path, meta=None, max_duration=178.0):
-    """
-    Checks the video duration and aspect ratio. 
-    If duration is over limits or aspect ratio isn't 9:16, it correctly 
-    trims/pads via FFmpeg and saves to a temporary file. Returns the path 
-    to the file to upload and a boolean indicating if it's a temp file.
-    """
     try:
         duration, w, h = 0, 0, 0
-        
-        # 1. Try to get it from yt-dlp metadata first (fastest)
         if meta and meta.get("duration") and meta.get("width") and meta.get("height"):
             duration = float(meta["duration"])
             w = int(meta["width"])
             h = int(meta["height"])
-        
-        # 2. Fallback to extracting from FFMPEG output string using RegEx
+
         if duration == 0 or w == 0 or h == 0:
             ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
             result = subprocess.run([ffmpeg_exe, "-i", video_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            
             d_match = re.search(r"Duration: (\d+):(\d+):(\d+\.\d+)", result.stderr)
             if d_match:
                 duration = int(d_match.group(1)) * 3600 + int(d_match.group(2)) * 60 + float(d_match.group(3))
-                
             res_match = re.search(r"Stream #.*: Video: .*, (\d+)x(\d+)[,\s]", result.stderr)
             if res_match:
                 w, h = int(res_match.group(1)), int(res_match.group(2))
-                
+
         if w == 0 or h == 0:
-            print(f"  Warning: Could not determine resolution. Skipping padding.")
             return video_path, False
-            
+
         aspect_ratio = w / h
-        # Ideal Shorts ratio is 9:16 (0.5625). If it's too wide (>0.6) or too skinny (<0.5), pad it.
         needs_padding = abs(aspect_ratio - (9/16)) > 0.05
 
         if duration > max_duration or needs_padding:
-            # Create a temporary file for the output
             temp_fd, temp_path = tempfile.mkstemp(suffix=".mp4")
             os.close(temp_fd)
-            
             ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
             cmd = [ffmpeg_exe, "-y", "-i", video_path]
-            
-            # Trim duration
             if duration > max_duration:
                 cmd.extend(["-t", str(max_duration)])
-            
-            # Pad / aspect ratio correction
             if needs_padding:
-                print(f"  Video is {w}x{h} (not 9:16). Encoding with black bars...")
                 cmd.extend([
                     "-vf", "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2,setsar=1",
-                    "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-                    "-c:a", "aac"
+                    "-c:v", "libx264", "-preset", "fast", "-crf", "23", "-c:a", "aac"
                 ])
             else:
-                print(f"  Video is {duration:.1f}s. Instantly stream-copying first {max_duration}s via FFmpeg...")
                 cmd.extend(["-c", "copy"])
-                
             cmd.append(temp_path)
-            
-            # Execute ffmpeg
             subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            
             return temp_path, True
-        
+
         return video_path, False
     except Exception as e:
-        print(f"  Error processing video with FFmpeg: {e}")
+        print(f"  FFmpeg error: {e}")
         return video_path, False
 
 
 def upload_video(youtube, video_path, title="", description="", tags=None, privacy="private"):
-    """Upload a single video to YouTube as a Short."""
     if not os.path.isfile(video_path):
         return {"error": f"File not found: {video_path}"}
-
-    # Default metadata for Shorts
     if not title:
         title = os.path.splitext(os.path.basename(video_path))[0]
     if "#Shorts" not in (description or ""):
@@ -207,313 +192,367 @@ def upload_video(youtube, video_path, title="", description="", tags=None, priva
         tags.append("Shorts")
 
     body = {
-        "snippet": {
-            "title": title,
-            "description": description,
-            "tags": tags,
-            "categoryId": "22",  # People & Blogs
-        },
-        "status": {
-            "privacyStatus": privacy,
-            "selfDeclaredMadeForKids": False,
-        },
+        "snippet": {"title": title, "description": description, "tags": tags, "categoryId": "22"},
+        "status": {"privacyStatus": privacy, "selfDeclaredMadeForKids": False},
     }
-
     media = MediaFileUpload(video_path, chunksize=-1, resumable=True)
-
-    req = youtube.videos().insert(
-        part="snippet,status",
-        body=body,
-        media_body=media,
-    )
-
+    req = youtube.videos().insert(part="snippet,status", body=body, media_body=media)
     response = None
     while response is None:
         status, response = req.next_chunk()
         if status:
             print(f"  Uploading… {int(status.progress() * 100)}%")
-
     video_id = response["id"]
-    # Provide the explicit Shorts URL format
     url = f"https://youtube.com/shorts/{video_id}"
     print(f"  ✓ Uploaded: {url}")
     return {"id": video_id, "url": url}
 
 
-# ── Routes ──────────────────────────────────────────────────────────
+# ── Routes ───────────────────────────────────────────────────────────
+
 @app.route("/")
 def index():
-    accounts = get_accounts()
-    logged_in = len(accounts) > 0
+    accounts = load_accounts()
+    active = get_active_account()
     success = request.args.get("success")
-    
+
+    # Build accounts list HTML
     accounts_html = ""
-    for email, acc in accounts.items():
-        pic = acc.get('picture', '')
-        name = acc.get('name', email)
-        accounts_html += f"""
-        <div style="display:flex; align-items:center; justify-content:space-between; background:rgba(255,255,255,0.03); border:1px solid rgba(255,255,255,0.1); padding:12px; border-radius:16px; margin-bottom:12px;">
-            <div style="display:flex; align-items:center;">
-                <img src="{pic}" style="width:36px; height:36px; border-radius:50%; border:2px solid var(--primary);">
-                <div style="margin-left:12px; text-align:left;">
-                    <div style="font-weight:600; font-size:14px; color:white;">{name}</div>
-                    <div style="font-size:11px; color:rgba(255,255,255,0.5);">{email}</div>
+    if accounts:
+        for email, info in accounts.items():
+            is_active = email == active
+            active_badge = '<span style="background:#2ed573;color:#000;font-size:10px;font-weight:700;padding:3px 8px;border-radius:20px;margin-left:8px;">ACTIVE</span>' if is_active else ''
+            accounts_html += f"""
+            <div style="display:flex;align-items:center;justify-content:space-between;padding:12px 16px;
+                        background:rgba(255,255,255,0.04);border:1px solid {'rgba(242,42,92,0.5)' if is_active else 'rgba(255,255,255,0.08)'};
+                        border-radius:12px;margin-bottom:8px;transition:all 0.2s;">
+                <div style="display:flex;align-items:center;gap:10px;text-align:left;">
+                    <div style="width:36px;height:36px;border-radius:50%;background:linear-gradient(135deg,#f22a5c,#7b2ff7);
+                                display:flex;align-items:center;justify-content:center;font-weight:800;font-size:14px;flex-shrink:0;">
+                        {email[0].upper()}
+                    </div>
+                    <div>
+                        <div style="font-size:13px;font-weight:600;">{email}{active_badge}</div>
+                        <div style="font-size:11px;color:#8892b0;">YouTube Channel</div>
+                    </div>
+                </div>
+                <div style="display:flex;gap:6px;">
+                    {'<span style="color:#8892b0;font-size:12px;padding:6px 10px;">✓</span>' if is_active else f'<a href="/set-active/{email}" style="background:rgba(242,42,92,0.15);color:#f22a5c;border:1px solid rgba(242,42,92,0.3);text-decoration:none;font-size:12px;font-weight:600;padding:6px 12px;border-radius:8px;">Use</a>'}
+                    <a href="/remove-account/{email}" onclick="return confirm('Remove {email}?')" 
+                       style="background:rgba(255,255,255,0.05);color:#8892b0;border:1px solid rgba(255,255,255,0.1);
+                              text-decoration:none;font-size:12px;padding:6px 10px;border-radius:8px;">✕</a>
                 </div>
             </div>
-            <div style="display:flex; align-items:center; gap: 16px;">
-                <label class="switch" style="position:relative; display:inline-block; width:44px; height:24px;">
-                    <input type="checkbox" name="target_emails" value="{email}" checked style="opacity:0; width:0; height:0;">
-                    <span class="slider round" style="position:absolute; cursor:pointer; top:0; left:0; right:0; bottom:0; background-color:rgba(255,255,255,0.1); transition:.4s; border-radius:24px;"></span>
-                </label>
-                <a href="/logout?email={email}" style="color:#f22a5c; font-size:24px; text-decoration:none; line-height:1;" title="Logout">×</a>
+            """
+
+    upload_section = ""
+    if active:
+        upload_section = f"""
+        <div style="margin-top:20px;padding-top:20px;border-top:1px solid rgba(255,255,255,0.08);">
+            <p style="color:#8892b0;font-size:12px;margin-bottom:12px;">Posting to: <strong style="color:#f22a5c;">{active}</strong></p>
+            <div id="upload-form">
+                <div style="display:flex;gap:8px;margin-bottom:12px;">
+                    <input type="url" id="url-input" placeholder="Paste TikTok / Reel URL..." 
+                           style="flex:1;padding:14px 16px;border-radius:12px;border:1px solid rgba(255,255,255,0.1);
+                                  background:rgba(0,0,0,0.3);color:white;font-size:14px;font-family:Inter,sans-serif;outline:none;">
+                    <button onclick="navigator.clipboard.readText().then(t=>document.getElementById('url-input').value=t)"
+                            style="background:rgba(255,255,255,0.07);border:1px solid rgba(255,255,255,0.1);color:white;
+                                   border-radius:12px;padding:0 14px;cursor:pointer;font-size:18px;" title="Paste">📋</button>
+                </div>
+                <button onclick="submitPost()"
+                        style="width:100%;background:linear-gradient(135deg,#f22a5c,#c0143c);color:white;border:none;
+                               padding:14px;border-radius:12px;font-size:15px;font-weight:700;cursor:pointer;
+                               transition:all 0.2s;letter-spacing:0.3px;">
+                    🚀 Post to YouTube Shorts
+                </button>
             </div>
         </div>
+        <script>
+        function submitPost() {{
+            const url = document.getElementById('url-input').value.trim();
+            if (!url) {{ alert('Please paste a URL first'); return; }}
+            document.getElementById('loader-overlay').style.display = 'flex';
+            const form = document.createElement('form');
+            form.method = 'POST';
+            form.action = '/tiktok';
+            const input = document.createElement('input');
+            input.type = 'hidden'; input.name = 'url'; input.value = url;
+            form.appendChild(input);
+            document.body.appendChild(form);
+            form.submit();
+        }}
+        </script>
         """
-    
+    elif accounts:
+        upload_section = """
+        <div style="margin-top:20px;padding-top:20px;border-top:1px solid rgba(255,255,255,0.08);
+                    color:#8892b0;font-size:13px;text-align:center;">
+            👆 Select an account above to start posting
+        </div>
+        """
+
+    no_accounts_html = ""
+    if not accounts:
+        no_accounts_html = """
+        <div style="text-align:center;padding:20px 0;color:#8892b0;">
+            <div style="font-size:40px;margin-bottom:12px;">📺</div>
+            <p style="font-size:14px;">No accounts added yet.<br>Add a Google account to get started.</p>
+        </div>
+        """
+
     return f"""
     <!DOCTYPE html>
     <html lang="en">
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Shorts Automation</title>
-        <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&display=swap" rel="stylesheet">
+        <title>Shorts Bot</title>
+        <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
         <style>
             :root {{
-                --bg-color: #0d0f12;
-                --surface-color: rgba(255, 255, 255, 0.05);
-                --border-color: rgba(255, 255, 255, 0.1);
+                --bg: #080a0e;
+                --surface: rgba(255,255,255,0.04);
+                --border: rgba(255,255,255,0.08);
                 --primary: #f22a5c;
-                --primary-hover: #d21c48;
-                --text-main: #ffffff;
-                --text-muted: #8892b0;
+                --primary-dim: rgba(242,42,92,0.15);
+                --text: #ffffff;
+                --muted: #8892b0;
             }}
             * {{ box-sizing: border-box; margin: 0; padding: 0; }}
             body {{
                 font-family: 'Inter', sans-serif;
-                background-color: var(--bg-color);
-                color: var(--text-main);
+                background: var(--bg);
+                color: var(--text);
+                min-height: 100vh;
                 display: flex;
                 align-items: center;
                 justify-content: center;
-                min-height: 100vh;
                 padding: 20px;
-                background: radial-gradient(circle at top right, #1f1122 0%, var(--bg-color) 60%);
+                background: radial-gradient(ellipse at 70% 0%, #1a0a2e 0%, var(--bg) 55%),
+                            radial-gradient(ellipse at 0% 100%, #0d1a2e 0%, transparent 50%);
             }}
             .card {{
-                background: var(--surface-color);
-                border: 1px solid var(--border-color);
-                border-radius: 24px;
-                padding: 40px 30px;
                 width: 100%;
-                max-width: 420px;
-                text-align: center;
-                backdrop-filter: blur(12px);
-                box-shadow: 0 20px 40px rgba(0,0,0,0.4);
+                max-width: 440px;
+                background: rgba(255,255,255,0.03);
+                border: 1px solid var(--border);
+                border-radius: 28px;
+                padding: 32px 28px;
+                backdrop-filter: blur(20px);
+                box-shadow: 0 30px 60px rgba(0,0,0,0.5), 0 0 0 1px rgba(255,255,255,0.05) inset;
             }}
-            h1 {{ font-size: 28px; font-weight: 800; margin-bottom: 8px; letter-spacing: -0.5px; }}
-            p.status {{ color: var(--text-muted); font-size: 14px; margin-bottom: 30px; }}
-            
-            .btn {{
-                background: var(--primary);
-                color: white;
-                border: none;
-                padding: 14px 24px;
+            .header {{
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                margin-bottom: 28px;
+            }}
+            .logo {{
+                display: flex;
+                align-items: center;
+                gap: 10px;
+            }}
+            .logo-icon {{
+                width: 40px; height: 40px;
+                background: linear-gradient(135deg, #f22a5c, #7b2ff7);
                 border-radius: 12px;
-                font-size: 16px;
-                font-weight: 600;
-                cursor: pointer;
-                transition: all 0.2s;
-                text-decoration: none;
-                display: inline-block;
-                width: 100%;
+                display: flex; align-items: center; justify-content: center;
+                font-size: 18px;
             }}
-            .btn:hover {{ background: var(--primary-hover); transform: translateY(-2px); }}
-            
-            .btn-login {{
-                background: #4285F4;
-                margin-top: 10px;
-            }}
-            .btn-login:hover {{ background: #2b70e4; }}
-
-            .input-field {{
-                width: 100%;
-                padding: 16px 20px;
-                border-radius: 12px;
-                border: 1px solid var(--border-color);
-                background: rgba(0,0,0,0.2);
-                color: white;
-                font-size: 15px;
-                margin-bottom: 20px;
-                font-family: 'Inter', sans-serif;
-                outline: none;
-                transition: border-color 0.2s;
-            }}
-            .input-field:focus {{ border-color: var(--primary); }}
-            .input-field::placeholder {{ color: #666; }}
-
-            .logout-link {{
-                color: var(--text-muted);
-                text-decoration: none;
+            .logo h1 {{ font-size: 20px; font-weight: 800; letter-spacing: -0.5px; }}
+            .logo span {{ font-size: 11px; color: var(--muted); font-weight: 500; display:block; margin-top:1px; }}
+            .add-btn {{
+                background: var(--primary-dim);
+                color: var(--primary);
+                border: 1px solid rgba(242,42,92,0.3);
+                padding: 8px 16px;
+                border-radius: 10px;
                 font-size: 13px;
-                margin-top: 20px;
-                display: inline-block;
-                transition: color 0.2s;
+                font-weight: 700;
+                cursor: pointer;
+                text-decoration: none;
+                transition: all 0.2s;
+                white-space: nowrap;
             }}
-            .logout-link:hover {{ color: white; }}
-            
-            /* Loader Overlay */
+            .add-btn:hover {{ background: rgba(242,42,92,0.25); transform: translateY(-1px); }}
+            .section-label {{
+                font-size: 11px;
+                font-weight: 700;
+                color: var(--muted);
+                letter-spacing: 1px;
+                text-transform: uppercase;
+                margin-bottom: 10px;
+            }}
+            /* Loader */
             #loader-overlay {{
-                position: fixed; top: 0; left: 0; width: 100%; height: 100%;
-                background: rgba(13, 15, 18, 0.9);
-                backdrop-filter: blur(8px);
-                display: none; flex-direction: column; align-items: center; justify-content: center;
+                position: fixed; inset: 0;
+                background: rgba(8,10,14,0.92);
+                backdrop-filter: blur(12px);
+                display: none; flex-direction: column;
+                align-items: center; justify-content: center;
                 z-index: 1000;
             }}
             .spinner {{
-                width: 50px; height: 50px;
-                border: 4px solid rgba(255,255,255,0.1);
+                width: 52px; height: 52px;
+                border: 3px solid rgba(255,255,255,0.08);
                 border-top-color: var(--primary);
                 border-radius: 50%;
-                animation: spin 1s linear infinite;
+                animation: spin 0.8s linear infinite;
                 margin-bottom: 20px;
             }}
             @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
-            
-            /* Toast Notification */
+            .loader-title {{ font-size: 18px; font-weight: 700; margin-bottom: 8px; }}
+            .loader-sub {{ color: var(--muted); font-size: 13px; text-align: center; max-width: 260px; line-height: 1.6; }}
+            /* Toast */
             .toast {{
-                position: fixed; top: 30px; right: 30px;
-                background: rgba(46, 213, 115, 0.15);
-                border: 1px solid #2ed573;
+                position: fixed; top: 24px; right: 24px;
+                background: rgba(46,213,115,0.12);
+                border: 1px solid rgba(46,213,115,0.4);
                 color: #2ed573;
-                padding: 16px 24px;
-                border-radius: 12px;
+                padding: 14px 20px;
+                border-radius: 14px;
                 font-weight: 600;
-                transform: translateX(120%);
-                animation: slideIn 0.5s ease forwards, slideOut 0.5s ease 5s forwards;
-                box-shadow: 0 10px 30px rgba(0,0,0,0.3);
+                font-size: 14px;
+                transform: translateX(140%);
+                animation: slideIn 0.4s cubic-bezier(0.34,1.56,0.64,1) forwards,
+                           slideOut 0.4s ease 5s forwards;
+                box-shadow: 0 8px 32px rgba(0,0,0,0.3);
                 z-index: 999;
+                display: flex; align-items: center; gap: 8px;
             }}
             @keyframes slideIn {{ to {{ transform: translateX(0); }} }}
-            @keyframes slideOut {{ to {{ transform: translateX(120%); }} }}
-            
-            .switch input:checked + .slider {{ background-color: var(--primary); }}
-            .switch input:focus + .slider {{ box-shadow: 0 0 1px var(--primary); }}
-            .switch input:checked + .slider:before {{ transform: translateX(20px); }}
-            .slider:before {{ position:absolute; content:""; height:18px; width:18px; left:3px; bottom:3px; background-color:white; transition:.4s; border-radius:50%; }}
+            @keyframes slideOut {{ to {{ transform: translateX(140%); }} }}
         </style>
     </head>
     <body>
-        { '<div class="toast">✅ Successfully uploaded </div>' if success else '' }
+        {'<div class="toast">✅ Successfully uploaded to YouTube Shorts!</div>' if success else ''}
 
         <div id="loader-overlay">
             <div class="spinner"></div>
-            <h3 style="margin-bottom: 8px;">Processing Video</h3>
-            <p style="color:var(--text-muted); font-size:14px; text-align:center; max-width:80%;">
-                Fetching metadata, injecting stream bytes, applying FFmpeg magic, and posting to YouTube...<br>Please wait!
-            </p>
+            <div class="loader-title">Processing Video</div>
+            <p class="loader-sub">Downloading, trimming with FFmpeg, and uploading to YouTube… Please wait!</p>
         </div>
 
         <div class="card">
-            <h1>Shorts Bot</h1>
-            <p class="status">● {f"{len(accounts)} Account(s) Authenticated" if logged_in else "Not authenticated"}</p>
-            {f'''
-            <form action="/tiktok" method="POST" onsubmit="document.getElementById('loader-overlay').style.display='flex'">
-                <div style="display:flex; gap:8px; margin-bottom:15px;">
-                    <input type="url" class="input-field" id="url-input" name="url" placeholder="Paste TikTok URL..." required autocomplete="off" style="margin-bottom:0;">
-                    <button type="button" onclick="navigator.clipboard.readText().then(t=>document.getElementById('url-input').value=t)" style="background:var(--border-color); border:1px solid var(--border-color); color:white; border-radius:12px; padding:0 16px; cursor:pointer; font-size:18px; white-space:nowrap;" title="Paste">📋</button>
+            <div class="header">
+                <div class="logo">
+                    <div class="logo-icon">▶</div>
+                    <div>
+                        <h1>Shorts Bot</h1>
+                        <span>{len(accounts)} account{'s' if len(accounts) != 1 else ''} connected</span>
+                    </div>
                 </div>
-                <div style="margin-bottom: 24px; text-align: center;">
-                    <label style="font-size: 14px; color: var(--text-muted); margin-bottom: 12px; display: block;">Select Channels to Upload</label>
-                    {accounts_html}
-                </div>
-                <button type="submit" class="btn">Post</button>
-            </form>
-            <a href='/login' target='_blank' class='btn btn-login' style='margin-top: 20px; background: #2B2C30; border: 1px solid var(--border-color);'>+ Add another account</a>
-            ''' if logged_in else "<a href='/login' target='_blank' class='btn btn-login'>Login with Google</a>"}
-            
-            { "<a href='/logout' class='logout-link'>Sign Out</a>" if logged_in else "" }
+                <a href="/add-account" target="_blank" class="add-btn">+ Add Account</a>
+            </div>
+
+            <div class="section-label">Connected Accounts</div>
+            {no_accounts_html}
+            {accounts_html}
+            {upload_section}
         </div>
     </body>
     </html>
     """
 
 
-@app.route("/login")
-def login():
+@app.route("/add-account")
+def add_account():
+    """Start OAuth flow to add a new account."""
     flow = get_flow()
-
     auth_url, state = flow.authorization_url(
-        access_type="offline",       # Get refresh token
+        access_type="offline",
         include_granted_scopes="true",
-        prompt="consent",            # Force consent to get refresh token
+        prompt="consent",
     )
-
     flask.session["state"] = state
-    # Store code verifier for PKCE (required by Google)
     flask.session["code_verifier"] = flow.code_verifier
     return redirect(auth_url)
+
+
+@app.route("/login")
+def login():
+    return redirect(url_for("add_account"))
 
 
 @app.route("/callback")
 def callback():
     state = flask.session.get("state")
     flow = get_flow(state=state)
-
-    # Restore PKCE code verifier from session
     flow.code_verifier = flask.session.get("code_verifier")
-
-    # Exchange auth code for credentials
     flow.fetch_token(authorization_response=request.url)
     creds = flow.credentials
 
-    try:
-        oauth2_client = build('oauth2', 'v2', credentials=creds)
-        user_info = oauth2_client.userinfo().get().execute()
-        email = user_info.get('email')
-        
-        accounts = get_accounts()
-        flask.session.permanent = True
-        accounts[email] = {
-            'email': email,
-            'name': user_info.get('name'),
-            'picture': user_info.get('picture'),
-            'token': creds.token,
-            'refresh_token': creds.refresh_token,
-            'token_uri': creds.token_uri,
-            'client_id': creds.client_id,
-            'client_secret': creds.client_secret,
-            'scopes': creds.scopes
-        }
-        flask.session['accounts'] = accounts
-        flask.session.modified = True
-    except Exception as e:
-        print(f"Failed to fetch user profile: {e}")
+    # Get email from Google
+    email = get_email_from_creds(creds)
+    if not email:
+        return "Could not retrieve email from Google. Please try again.", 400
 
+    # Save credentials and register account
+    save_credentials_for(creds, email)
+    accounts = load_accounts()
+    accounts[email] = {"email": email}
+    save_accounts(accounts)
+
+    # Auto-set as active if it's the first account
+    if len(accounts) == 1 or not get_active_account():
+        flask.session["active_account"] = email
+
+    # Close popup and refresh parent
+    return """
+    <html><body>
+    <script>
+        if (window.opener) {
+            window.opener.location.reload();
+            window.close();
+        } else {
+            window.location.href = '/';
+        }
+    </script>
+    <p>Account added! You can close this tab.</p>
+    </body></html>
+    """
+
+
+@app.route("/set-active/<email>")
+def set_active(email):
+    accounts = load_accounts()
+    if email in accounts:
+        flask.session["active_account"] = email
+    return redirect(url_for("index"))
+
+
+@app.route("/remove-account/<email>")
+def remove_account(email):
+    accounts = load_accounts()
+    if email in accounts:
+        del accounts[email]
+        save_accounts(accounts)
+    path = token_path(email)
+    if os.path.exists(path):
+        os.remove(path)
+    # If removed account was active, switch to another
+    if get_active_account() == email:
+        flask.session.pop("active_account", None)
+        if accounts:
+            flask.session["active_account"] = list(accounts.keys())[0]
     return redirect(url_for("index"))
 
 
 @app.route("/logout")
 def logout():
-    email = request.args.get('email')
-    accounts = get_accounts()
-    if email and email in accounts:
-        del accounts[email]
-        flask.session['accounts'] = accounts
-        flask.session.modified = True
-    else:
-        flask.session.pop('accounts', None)
-        
+    flask.session.clear()
     return redirect(url_for("index"))
 
 
 @app.route("/tiktok", methods=["POST"])
 def download_tiktok():
     target_url = request.form.get("url")
-    target_emails = request.form.getlist("target_emails")
-    
+    active = get_active_account()
+
     if not target_url:
         return jsonify({"error": "No URL provided"})
+    if not active:
+        return jsonify({"error": "No active account selected"})
 
     ydl_opts = {
         'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
@@ -526,126 +565,89 @@ def download_tiktok():
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            print(f"Downloading TikTok: {target_url}")
+            print(f"Downloading: {target_url}")
             info = ydl.extract_info(target_url, download=True)
-            
-            redir_url = url_for("upload") + "?" + "&".join([f"target_email={e}" for e in target_emails])
-            return redirect(redir_url)
+            return redirect(url_for("upload", account=active))
     except Exception as e:
         return jsonify({"error": str(e)})
 
 
 @app.route("/upload")
 def upload():
-    accounts = get_accounts()
-    if not accounts:
-        return redirect(url_for("login"))
-        
-    target_emails = request.args.getlist("target_email")
-    
-    upload_clients = []
-    
-    for em in target_emails:
-        if em in accounts:
-            creds = load_credentials(em)
-            if creds and creds.valid:
-                upload_clients.append(get_youtube_client(creds))
-            
-    if not upload_clients:
-        return jsonify({"error": "Valid credentials not found for selected account(s). Please login again."})
+    account = request.args.get("account") or get_active_account()
+    if not account:
+        return redirect(url_for("index"))
 
-    # Find all .mp4 files in the videos/ folder and videos/temp/ folder
+    creds = load_credentials_for(account)
+    if not creds or not creds.valid:
+        return redirect(url_for("add_account"))
+
+    youtube = get_youtube_client(creds)
+
     videos_to_upload = []
-    
-    if os.path.isdir(VIDEO_DIR):
-        for f in os.listdir(VIDEO_DIR):
-            if f.lower().endswith(".mp4") and os.path.isfile(os.path.join(VIDEO_DIR, f)):
-                videos_to_upload.append(os.path.join(VIDEO_DIR, f))
-                
-    if os.path.isdir(TEMP_DIR):
-        for f in os.listdir(TEMP_DIR):
-            if f.lower().endswith(".mp4") and os.path.isfile(os.path.join(TEMP_DIR, f)):
-                videos_to_upload.append(os.path.join(TEMP_DIR, f))
+    for folder in [VIDEO_DIR, TEMP_DIR]:
+        if os.path.isdir(folder):
+            for f in os.listdir(folder):
+                full = os.path.join(folder, f)
+                if f.lower().endswith(".mp4") and os.path.isfile(full):
+                    videos_to_upload.append(full)
 
     if not videos_to_upload:
-        return jsonify({"error": f"No .mp4 files found in '{VIDEO_DIR}/' or '{TEMP_DIR}/'."})
+        return jsonify({"error": "No .mp4 files found."})
 
     results = []
     for original_path in videos_to_upload:
         vid = os.path.basename(original_path)
         print(f"Processing: {vid}")
-        
-        # Default metadata
+
         yt_title = os.path.splitext(vid)[0]
         yt_desc = ""
         yt_tags = []
-        
-        # Look for the metadata JSON file created by yt-dlp
+
         base_name = os.path.splitext(original_path)[0]
         json_path = base_name + ".info.json"
-        
+
         meta = None
         if os.path.exists(json_path):
             with open(json_path, "r", encoding="utf-8") as f:
                 meta = json.load(f)
-                
-                # Fetch data from TikTok
                 raw_title = meta.get("title", "")
                 yt_desc = meta.get("description", raw_title)
                 yt_tags = meta.get("tags", [])
-                    
-                # YouTube limits titles to 100 characters. We'll trim at 90.
                 yt_title = (raw_title[:90] + "...") if len(raw_title) > 95 else raw_title
                 if not yt_title:
                     yt_title = "TikTok Video"
-        
-        # Trim video if necessary
+
         upload_path, is_temp = trim_video_for_shorts(original_path, meta=meta)
-        
+
         upload_success = False
         try:
-            for youtube in upload_clients:
-                result = upload_video(
-                    youtube, 
-                    upload_path, 
-                    title=yt_title,
-                    description=yt_desc,
-                    tags=yt_tags
-                )
-            results.append({"file": vid, "trimmed": is_temp, "success": True})
+            result = upload_video(youtube, upload_path, title=yt_title, description=yt_desc, tags=yt_tags)
+            results.append({"file": vid, "trimmed": is_temp, **result})
             upload_success = True
         except HttpError as e:
             results.append({"file": vid, "error": str(e)})
-            
-        # 1. ALWAYS clean up the ffmpeg trimmed file if created
+
         if is_temp and os.path.exists(upload_path):
             try:
                 os.remove(upload_path)
             except OSError:
                 pass
-        
-        # 2. If the video posted successfully AND it was a TikTok download (in TEMP_DIR), delete the raw file and JSON
-        if upload_success and TEMP_DIR in original_path:
-            if os.path.exists(json_path):
-                try:
-                    os.remove(json_path)
-                except OSError:
-                    pass
-            if os.path.exists(original_path):
-                try:
-                    os.remove(original_path)
-                except OSError:
-                    pass
 
-    # Return a redirect back to the home page with a success flag
+        if upload_success and TEMP_DIR in original_path:
+            for cleanup in [json_path, original_path]:
+                if os.path.exists(cleanup):
+                    try:
+                        os.remove(cleanup)
+                    except OSError:
+                        pass
+
     if any("error" not in r for r in results):
         return redirect(url_for("index", success=1))
-    
-    # If everything failed, just return the raw errors
     return jsonify({"errors": results})
 
 
-# ── Main ────────────────────────────────────────────────────────────
+# ── Main ─────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     print("YouTube Shorts Auto-Upload Bot")
     if os.environ.get("FLASK_ENV") == "development":
