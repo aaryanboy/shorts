@@ -423,13 +423,26 @@ def login():
 @app.route("/callback")
 def callback():
     state = flask.session.get("state")
+    if not state:
+        return "Error: Session state is missing. Please make sure cookies are enabled and try again.", 400
+        
     flow = get_flow(state=state)
 
     # Restore PKCE code verifier from session
     flow.code_verifier = flask.session.get("code_verifier")
 
-    # Exchange auth code for credentials
-    flow.fetch_token(authorization_response=request.url)
+    # In environments like HF Spaces, request.url might default to http:// even with ProxyFix.
+    # OAuth strictly requires https:// for the callback mismatch check.
+    auth_response = request.url
+    if os.environ.get("FLASK_ENV") != "development" and auth_response.startswith("http://"):
+        auth_response = auth_response.replace("http://", "https://", 1)
+
+    try:
+        # Exchange auth code for credentials
+        flow.fetch_token(authorization_response=auth_response)
+    except Exception as e:
+        return f"OAuth Error: {str(e)}<br><br>Debug info:<br>URL used: {auth_response}", 500
+
     creds = flow.credentials
     save_credentials(creds)
 
