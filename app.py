@@ -16,6 +16,7 @@ import json
 import re
 from werkzeug.middleware.proxy_fix import ProxyFix
 
+
 # ── Config ──────────────────────────────────────────────────────────
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", "shorts-automation-secret-key")
@@ -191,7 +192,7 @@ def trim_video_for_shorts(video_path, meta=None, max_duration=178.0):
         return video_path, False
 
 
-def upload_video(youtube, video_path, title="", description="", tags=None, privacy="private"):
+def upload_video(youtube, video_path, title="", description="", tags=None, privacy="public"):
     """Upload a single video to YouTube as a Short."""
     if not os.path.isfile(video_path):
         return {"error": f"File not found: {video_path}"}
