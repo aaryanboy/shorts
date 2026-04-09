@@ -2,6 +2,7 @@ import os
 import pickle
 import flask
 from flask import Flask, redirect, request, url_for, jsonify
+from datetime import timedelta
 import google.oauth2.credentials
 from google.auth.transport.requests import Request
 import google_auth_oauthlib.flow
@@ -20,6 +21,7 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 # ── Config ──────────────────────────────────────────────────────────
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", "shorts-automation-secret-key")
+app.permanent_session_lifetime = timedelta(days=90)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
 
 # Allow HTTP for local dev (remove in production)
@@ -68,6 +70,7 @@ def load_credentials():
 
 def save_credentials(creds):
     """Persist credentials to flask session for multi-user isolation."""
+    flask.session.permanent = True
     flask.session['credentials'] = {
         'token': creds.token,
         'refresh_token': creds.refresh_token,
@@ -235,7 +238,6 @@ def upload_video(youtube, video_path, title="", description="", tags=None, priva
             print(f"  Uploading… {int(status.progress() * 100)}%")
 
     video_id = response["id"]
-    # Provide the explicit Shorts URL format
     url = f"https://youtube.com/shorts/{video_id}"
     print(f"  ✓ Uploaded: {url}")
     return {"id": video_id, "url": url}
@@ -413,13 +415,12 @@ def login():
     flow = get_flow()
 
     auth_url, state = flow.authorization_url(
-        access_type="offline",       # Get refresh token
+        access_type="offline",
         include_granted_scopes="true",
-        prompt="consent",            # Force consent to get refresh token
+        prompt="consent",
     )
 
     flask.session["state"] = state
-    # Store code verifier for PKCE (required by Google)
     flask.session["code_verifier"] = flow.code_verifier
     return redirect(auth_url)
 
@@ -431,18 +432,13 @@ def callback():
         return "Error: Session state is missing. Please make sure cookies are enabled and try again.", 400
         
     flow = get_flow(state=state)
-
-    # Restore PKCE code verifier from session
     flow.code_verifier = flask.session.get("code_verifier")
 
-    # In environments like HF Spaces, request.url might default to http:// even with ProxyFix.
-    # OAuth strictly requires https:// for the callback mismatch check.
     auth_response = request.url
     if os.environ.get("FLASK_ENV") != "development" and auth_response.startswith("http://"):
         auth_response = auth_response.replace("http://", "https://", 1)
 
     try:
-        # Exchange auth code for credentials
         flow.fetch_token(authorization_response=auth_response)
     except Exception as e:
         return f"OAuth Error: {str(e)}<br><br>Debug info:<br>URL used: {auth_response}", 500
@@ -471,7 +467,7 @@ def download_tiktok():
         'merge_output_format': 'mp4',
         'quiet': True,
         'no_warnings': True,
-        'writeinfojson': True, # This saves the metadata to a .info.json file!
+        'writeinfojson': True,
     }
 
     try:
@@ -479,8 +475,6 @@ def download_tiktok():
             print(f"Downloading TikTok: {target_url}")
             info = ydl.extract_info(target_url, download=True)
             filename = ydl.prepare_filename(info)
-            
-            # Immediately trigger the upload process so it's a 1-click operation
             return redirect(url_for("upload"))
     except Exception as e:
         return jsonify({"error": str(e)})
@@ -494,7 +488,6 @@ def upload():
 
     youtube = get_youtube_client(creds)
 
-    # Find all .mp4 files in the videos/ folder and videos/temp/ folder
     videos_to_upload = []
     
     if os.path.isdir(VIDEO_DIR):
@@ -515,12 +508,10 @@ def upload():
         vid = os.path.basename(original_path)
         print(f"Processing: {vid}")
         
-        # Default metadata
         yt_title = os.path.splitext(vid)[0]
         yt_desc = ""
         yt_tags = []
         
-        # Look for the metadata JSON file created by yt-dlp
         base_name = os.path.splitext(original_path)[0]
         json_path = base_name + ".info.json"
         
@@ -528,18 +519,13 @@ def upload():
         if os.path.exists(json_path):
             with open(json_path, "r", encoding="utf-8") as f:
                 meta = json.load(f)
-                
-                # Fetch data from TikTok
                 raw_title = meta.get("title", "")
                 yt_desc = meta.get("description", raw_title)
                 yt_tags = meta.get("tags", [])
-                    
-                # YouTube limits titles to 100 characters. We'll trim at 90.
                 yt_title = (raw_title[:90] + "...") if len(raw_title) > 95 else raw_title
                 if not yt_title:
                     yt_title = "TikTok Video"
         
-        # Trim video if necessary
         upload_path, is_temp = trim_video_for_shorts(original_path, meta=meta)
         
         upload_success = False
@@ -556,14 +542,12 @@ def upload():
         except HttpError as e:
             results.append({"file": vid, "error": str(e)})
             
-        # 1. ALWAYS clean up the ffmpeg trimmed file if created
         if is_temp and os.path.exists(upload_path):
             try:
                 os.remove(upload_path)
             except OSError:
                 pass
         
-        # 2. If the video posted successfully AND it was a TikTok download (in TEMP_DIR), delete the raw file and JSON
         if upload_success and TEMP_DIR in original_path:
             if os.path.exists(json_path):
                 try:
@@ -576,11 +560,9 @@ def upload():
                 except OSError:
                     pass
 
-    # Return a redirect back to the home page with a success flag
     if any("error" not in r for r in results):
         return redirect(url_for("index", success=1))
     
-    # If everything failed, just return the raw errors
     return jsonify({"errors": results})
 
 
