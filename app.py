@@ -676,6 +676,7 @@ def upload():
     return jsonify({"errors": results})
 
 
+
 # ── Main ────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     print("YouTube Shorts Auto-Upload Bot")
