@@ -37,7 +37,13 @@ TEMP_DIR = os.path.join(VIDEO_DIR, "temp")
 os.makedirs(VIDEO_DIR, exist_ok=True)
 os.makedirs(TEMP_DIR, exist_ok=True)
 
-ACCOUNT_SLOTS = ["account_1", "account_2"]
+ACCOUNT_SLOTS = ["account_1", "account_2", "account_3", "account_4"]
+DEFAULT_NAMES  = {"account_1": "Account 1", "account_2": "Account 2",
+                  "account_3": "Account 3", "account_4": "Account 4"}
+
+
+def get_account_name(slot):
+    return flask.session.get(f"name_{slot}", DEFAULT_NAMES.get(slot, slot))
 
 
 def load_credentials(slot):
@@ -125,7 +131,8 @@ def trim_video_for_shorts(video_path, meta=None, max_duration=178.0):
 
         if duration == 0 or w == 0 or h == 0:
             ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
-            result = subprocess.run([ffmpeg_exe, "-i", video_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            result = subprocess.run([ffmpeg_exe, "-i", video_path],
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
             d_match = re.search(r"Duration: (\d+):(\d+):(\d+\.\d+)", result.stderr)
             if d_match:
@@ -138,8 +145,7 @@ def trim_video_for_shorts(video_path, meta=None, max_duration=178.0):
         if w == 0 or h == 0:
             return video_path, False
 
-        aspect_ratio = w / h
-        needs_padding = abs(aspect_ratio - (9/16)) > 0.05
+        needs_padding = abs((w / h) - (9 / 16)) > 0.05
 
         if duration > max_duration or needs_padding:
             temp_fd, temp_path = tempfile.mkstemp(suffix=".mp4")
@@ -153,7 +159,9 @@ def trim_video_for_shorts(video_path, meta=None, max_duration=178.0):
 
             if needs_padding:
                 cmd.extend([
-                    "-vf", "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2,setsar=1",
+                    "-vf",
+                    "scale=1080:1920:force_original_aspect_ratio=decrease,"
+                    "pad=1080:1920:(ow-iw)/2:(oh-ih)/2,setsar=1",
                     "-c:v", "libx264", "-preset", "fast", "-crf", "23",
                     "-c:a", "aac"
                 ])
@@ -212,7 +220,6 @@ def upload_video(youtube, video_path, title="", description="", tags=None, priva
 
 
 def do_upload_for_slot(slot, videos_to_upload):
-    """Run the full upload pipeline for a given account slot."""
     creds = load_credentials(slot)
     if not creds or not creds.valid:
         return None, "not_authenticated"
@@ -222,9 +229,7 @@ def do_upload_for_slot(slot, videos_to_upload):
 
     for original_path in videos_to_upload:
         vid = os.path.basename(original_path)
-        yt_title = os.path.splitext(vid)[0]
-        yt_desc = ""
-        yt_tags = []
+        yt_title, yt_desc, yt_tags = os.path.splitext(vid)[0], "", []
 
         base_name = os.path.splitext(original_path)[0]
         json_path = base_name + ".info.json"
@@ -244,7 +249,8 @@ def do_upload_for_slot(slot, videos_to_upload):
 
         upload_success = False
         try:
-            result = upload_video(youtube, upload_path, title=yt_title, description=yt_desc, tags=yt_tags)
+            result = upload_video(youtube, upload_path,
+                                  title=yt_title, description=yt_desc, tags=yt_tags)
             results.append({"file": vid, "trimmed": is_temp, **result})
             upload_success = True
         except HttpError as e:
@@ -270,27 +276,27 @@ def do_upload_for_slot(slot, videos_to_upload):
 # ── Routes ──────────────────────────────────────────────────────────
 @app.route("/")
 def index():
-    slot_status = {}
-    for slot in ACCOUNT_SLOTS:
-        creds = load_credentials(slot)
-        slot_status[slot] = creds is not None and creds.valid
-
     success = request.args.get("success")
-    acct_label = {"account_1": "Account 1", "account_2": "Account 2"}
 
-    # Build account cards HTML
     account_cards_html = ""
     for slot in ACCOUNT_SLOTS:
-        logged_in = slot_status[slot]
-        label = acct_label[slot]
+        creds = load_credentials(slot)
+        logged_in = creds is not None and creds.valid
+        name = get_account_name(slot)
         dot_color = "#2ed573" if logged_in else "#ff4757"
         status_text = "Authenticated" if logged_in else "Not authenticated"
 
         if logged_in:
             card_content = f"""
-            <div style="display:flex; gap:8px; margin-bottom:16px;">
-                <input type="url" class="input-field" id="url-input-{slot}" placeholder="Paste TikTok URL..." autocomplete="off" style="margin-bottom:0;">
-                <button type="button" onclick="navigator.clipboard.readText().then(t=>document.getElementById('url-input-{slot}').value=t)" style="background:var(--border-color); border:1px solid var(--border-color); color:white; border-radius:12px; padding:0 16px; cursor:pointer; font-size:18px; white-space:nowrap;" title="Paste">📋</button>
+            <div style="display:flex; gap:8px; margin-bottom:14px;">
+                <input type="url" class="input-field" id="url-input-{slot}"
+                       placeholder="Paste TikTok URL..." autocomplete="off"
+                       style="margin-bottom:0; flex:1;">
+                <button type="button"
+                        onclick="navigator.clipboard.readText().then(t=>document.getElementById('url-input-{slot}').value=t)"
+                        style="background:var(--border-color); border:1px solid var(--border-color);
+                               color:white; border-radius:12px; padding:0 14px; cursor:pointer;
+                               font-size:16px; white-space:nowrap;" title="Paste">📋</button>
             </div>
             <button class="btn" onclick="submitTikTok('{slot}')">Post</button>
             <br>
@@ -304,8 +310,18 @@ def index():
         account_cards_html += f"""
         <div class="account-card">
             <div class="account-header">
-                <span class="account-label">{label}</span>
-                <span style="color:{dot_color}; font-size:12px;">● {status_text}</span>
+                <div style="display:flex; align-items:center; gap:8px; flex:1;">
+                    <span class="pencil-icon" onclick="startRename('{slot}')" title="Rename">✏️</span>
+                    <span class="account-label" id="label-{slot}">{name}</span>
+                    <div id="rename-form-{slot}" style="display:none; flex:1;">
+                        <input type="text" id="rename-input-{slot}" value="{name}"
+                               class="rename-input"
+                               onkeydown="if(event.key==='Enter') saveRename('{slot}'); if(event.key==='Escape') cancelRename('{slot}');">
+                        <button onclick="saveRename('{slot}')" class="rename-btn">✓</button>
+                        <button onclick="cancelRename('{slot}')" class="rename-btn cancel">✕</button>
+                    </div>
+                </div>
+                <span style="color:{dot_color}; font-size:12px; white-space:nowrap; margin-left:8px;">● {status_text}</span>
             </div>
             {card_content}
         </div>
@@ -322,8 +338,8 @@ def index():
         <style>
             :root {{
                 --bg-color: #0d0f12;
-                --surface-color: rgba(255, 255, 255, 0.05);
-                --border-color: rgba(255, 255, 255, 0.1);
+                --surface-color: rgba(255,255,255,0.05);
+                --border-color: rgba(255,255,255,0.1);
                 --primary: #f22a5c;
                 --primary-hover: #d21c48;
                 --text-main: #ffffff;
@@ -332,45 +348,76 @@ def index():
             * {{ box-sizing: border-box; margin: 0; padding: 0; }}
             body {{
                 font-family: 'Inter', sans-serif;
-                background-color: var(--bg-color);
+                background: radial-gradient(circle at top right, #1f1122 0%, var(--bg-color) 60%);
                 color: var(--text-main);
                 display: flex;
                 align-items: center;
                 justify-content: center;
                 min-height: 100vh;
                 padding: 20px;
-                background: radial-gradient(circle at top right, #1f1122 0%, var(--bg-color) 60%);
             }}
             .card {{
                 background: var(--surface-color);
                 border: 1px solid var(--border-color);
                 border-radius: 24px;
-                padding: 40px 30px;
+                padding: 36px 28px;
                 width: 100%;
                 max-width: 460px;
-                text-align: center;
                 backdrop-filter: blur(12px);
                 box-shadow: 0 20px 40px rgba(0,0,0,0.4);
             }}
-            h1 {{ font-size: 28px; font-weight: 800; margin-bottom: 24px; letter-spacing: -0.5px; }}
+            h1 {{
+                font-size: 26px; font-weight: 800;
+                margin-bottom: 24px; letter-spacing: -0.5px;
+                text-align: center;
+            }}
             .account-card {{
                 background: rgba(255,255,255,0.03);
                 border: 1px solid var(--border-color);
                 border-radius: 16px;
-                padding: 20px;
-                margin-bottom: 16px;
-                text-align: left;
+                padding: 18px;
+                margin-bottom: 14px;
             }}
             .account-header {{
                 display: flex;
                 justify-content: space-between;
                 align-items: center;
-                margin-bottom: 16px;
+                margin-bottom: 14px;
             }}
             .account-label {{
                 font-weight: 700;
                 font-size: 15px;
             }}
+            .pencil-icon {{
+                cursor: pointer;
+                font-size: 13px;
+                opacity: 0.5;
+                transition: opacity 0.2s;
+                user-select: none;
+            }}
+            .pencil-icon:hover {{ opacity: 1; }}
+            .rename-input {{
+                background: rgba(0,0,0,0.3);
+                border: 1px solid var(--primary);
+                border-radius: 8px;
+                color: white;
+                padding: 4px 10px;
+                font-size: 14px;
+                font-family: 'Inter', sans-serif;
+                font-weight: 700;
+                width: 140px;
+                outline: none;
+            }}
+            .rename-btn {{
+                background: none;
+                border: none;
+                color: #2ed573;
+                cursor: pointer;
+                font-size: 14px;
+                padding: 0 6px;
+                font-weight: 700;
+            }}
+            .rename-btn.cancel {{ color: #ff4757; }}
             .btn {{
                 background: var(--primary);
                 color: white;
@@ -384,13 +431,14 @@ def index():
                 text-decoration: none;
                 display: inline-block;
                 width: 100%;
+                text-align: center;
             }}
             .btn:hover {{ background: var(--primary-hover); transform: translateY(-2px); }}
             .btn-login {{ background: #4285F4; }}
             .btn-login:hover {{ background: #2b70e4; }}
             .input-field {{
                 width: 100%;
-                padding: 14px 16px;
+                padding: 13px 16px;
                 border-radius: 12px;
                 border: 1px solid var(--border-color);
                 background: rgba(0,0,0,0.2);
@@ -401,20 +449,21 @@ def index():
                 transition: border-color 0.2s;
             }}
             .input-field:focus {{ border-color: var(--primary); }}
-            .input-field::placeholder {{ color: #666; }}
+            .input-field::placeholder {{ color: #555; }}
             .logout-link {{
                 color: var(--text-muted);
                 text-decoration: none;
                 font-size: 12px;
-                margin-top: 12px;
+                margin-top: 10px;
                 display: inline-block;
             }}
             .logout-link:hover {{ color: white; }}
             #loader-overlay {{
                 position: fixed; top: 0; left: 0; width: 100%; height: 100%;
-                background: rgba(13, 15, 18, 0.9);
+                background: rgba(13,15,18,0.92);
                 backdrop-filter: blur(8px);
-                display: none; flex-direction: column; align-items: center; justify-content: center;
+                display: none; flex-direction: column;
+                align-items: center; justify-content: center;
                 z-index: 1000;
             }}
             .spinner {{
@@ -427,20 +476,20 @@ def index():
             }}
             @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
             .toast {{
-                position: fixed; top: 30px; right: 30px;
-                background: rgba(46, 213, 115, 0.15);
+                position: fixed; top: 24px; right: 24px;
+                background: rgba(46,213,115,0.15);
                 border: 1px solid #2ed573;
                 color: #2ed573;
-                padding: 16px 24px;
+                padding: 14px 22px;
                 border-radius: 12px;
                 font-weight: 600;
-                transform: translateX(120%);
-                animation: slideIn 0.5s ease forwards, slideOut 0.5s ease 5s forwards;
+                transform: translateX(130%);
+                animation: slideIn 0.4s ease forwards, slideOut 0.4s ease 5s forwards;
                 box-shadow: 0 10px 30px rgba(0,0,0,0.3);
                 z-index: 999;
             }}
             @keyframes slideIn {{ to {{ transform: translateX(0); }} }}
-            @keyframes slideOut {{ to {{ transform: translateX(120%); }} }}
+            @keyframes slideOut {{ to {{ transform: translateX(130%); }} }}
         </style>
     </head>
     <body>
@@ -448,7 +497,7 @@ def index():
 
         <div id="loader-overlay">
             <div class="spinner"></div>
-            <h3 style="margin-bottom: 8px;">Processing Video</h3>
+            <h3 style="margin-bottom:8px;">Processing Video</h3>
             <p style="color:var(--text-muted); font-size:14px; text-align:center; max-width:80%;">
                 Fetching metadata, applying FFmpeg magic, and posting to YouTube...<br>Please wait!
             </p>
@@ -467,23 +516,59 @@ def index():
             const form = document.createElement('form');
             form.method = 'POST';
             form.action = '/tiktok';
-            const urlInput = document.createElement('input');
-            urlInput.type = 'hidden';
-            urlInput.name = 'url';
-            urlInput.value = url;
-            const slotInput = document.createElement('input');
-            slotInput.type = 'hidden';
-            slotInput.name = 'slot';
-            slotInput.value = slot;
-            form.appendChild(urlInput);
-            form.appendChild(slotInput);
+            [['url', url], ['slot', slot]].forEach(([n, v]) => {{
+                const i = document.createElement('input');
+                i.type = 'hidden'; i.name = n; i.value = v;
+                form.appendChild(i);
+            }});
             document.body.appendChild(form);
             form.submit();
+        }}
+
+        function startRename(slot) {{
+            document.getElementById('label-' + slot).style.display = 'none';
+            document.getElementById('rename-form-' + slot).style.display = 'flex';
+            document.getElementById('rename-input-' + slot).focus();
+            document.getElementById('rename-input-' + slot).select();
+        }}
+
+        function cancelRename(slot) {{
+            document.getElementById('rename-form-' + slot).style.display = 'none';
+            document.getElementById('label-' + slot).style.display = 'inline';
+        }}
+
+        function saveRename(slot) {{
+            const newName = document.getElementById('rename-input-' + slot).value.trim();
+            if (!newName) {{ cancelRename(slot); return; }}
+            fetch('/rename', {{
+                method: 'POST',
+                headers: {{'Content-Type': 'application/json'}},
+                body: JSON.stringify({{slot: slot, name: newName}})
+            }})
+            .then(r => r.json())
+            .then(data => {{
+                if (data.ok) {{
+                    document.getElementById('label-' + slot).textContent = newName;
+                }}
+                cancelRename(slot);
+            }});
         }}
         </script>
     </body>
     </html>
     """
+
+
+@app.route("/rename", methods=["POST"])
+def rename():
+    data = request.get_json()
+    slot = data.get("slot")
+    name = data.get("name", "").strip()
+    if slot not in ACCOUNT_SLOTS or not name:
+        return jsonify({"ok": False})
+    flask.session.permanent = True
+    flask.session[f"name_{slot}"] = name[:30]  # max 30 chars
+    return jsonify({"ok": True})
 
 
 @app.route("/login/<slot>")
@@ -579,7 +664,7 @@ def upload():
                     videos_to_upload.append(os.path.join(folder, f))
 
     if not videos_to_upload:
-        return jsonify({"error": f"No .mp4 files found."})
+        return jsonify({"error": "No .mp4 files found."})
 
     results, err = do_upload_for_slot(slot, videos_to_upload)
     if err == "not_authenticated":
