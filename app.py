@@ -408,6 +408,7 @@ def index():
                 width: 140px;
                 outline: none;
             }}
+            
             .rename-btn {{
                 background: none;
                 border: none;
