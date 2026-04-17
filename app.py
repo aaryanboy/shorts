@@ -17,7 +17,6 @@ import re
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 
-
 # ── Config ──────────────────────────────────────────────────────────
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", "shorts-automation-secret-key")
@@ -105,17 +104,18 @@ def get_flow(state=None):
 
 
 # ── Video helpers ────────────────────────────────────────────────────
-def trim_and_pad(video_path, meta=None, max_duration=178.0):
-    """Return (path_to_upload, is_temp). Pads to 9:16 and trims if needed."""
+def trim_if_needed(video_path, meta=None, max_duration=178.0):
+    """
+    Only trim if video exceeds max_duration.
+    Uses -c copy (stream copy) — zero re-encoding, minimal CPU.
+    TikTok videos are already 9:16 so padding is skipped entirely.
+    Returns (path_to_upload, is_temp).
+    """
     try:
-        duration = w = h = 0
+        duration = float((meta or {}).get("duration") or 0)
 
-        if meta:
-            duration = float(meta.get("duration") or 0)
-            w = int(meta.get("width") or 0)
-            h = int(meta.get("height") or 0)
-
-        if not all([duration, w, h]):
+        if duration == 0:
+            # Fast ffprobe-style probe — no decoding
             ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
             probe = subprocess.run(
                 [ffmpeg_exe, "-i", video_path],
@@ -123,42 +123,27 @@ def trim_and_pad(video_path, meta=None, max_duration=178.0):
             )
             d_m = re.search(r"Duration: (\d+):(\d+):(\d+\.\d+)", probe.stderr)
             if d_m:
-                duration = int(d_m.group(1)) * 3600 + int(d_m.group(2)) * 60 + float(d_m.group(3))
-            r_m = re.search(r"Stream #.*: Video: .*, (\d+)x(\d+)[,\s]", probe.stderr)
-            if r_m:
-                w, h = int(r_m.group(1)), int(r_m.group(2))
+                duration = (int(d_m.group(1)) * 3600
+                            + int(d_m.group(2)) * 60
+                            + float(d_m.group(3)))
 
-        if not w or not h:
-            return video_path, False
+        if duration <= max_duration:
+            return video_path, False  # nothing to do — upload as-is
 
-        needs_pad = abs((w / h) - (9 / 16)) > 0.05
-        needs_trim = duration > max_duration
-
-        if not needs_pad and not needs_trim:
-            return video_path, False
-
+        # Trim only — stream copy, no re-encode (uses ~1% CPU instead of 98%)
         fd, out_path = tempfile.mkstemp(suffix=".mp4", dir=TEMP_DIR)
         os.close(fd)
 
         ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
-        cmd = [ffmpeg_exe, "-y", "-i", video_path]
-
-        if needs_trim:
-            cmd += ["-t", str(max_duration)]
-
-        if needs_pad:
-            cmd += [
-                "-vf",
-                "scale=1080:1920:force_original_aspect_ratio=decrease,"
-                "pad=1080:1920:(ow-iw)/2:(oh-ih)/2,setsar=1",
-                "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-                "-c:a", "aac",
-            ]
-        else:
-            cmd += ["-c", "copy"]
-
-        cmd.append(out_path)
-        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(
+            [ffmpeg_exe, "-y", "-i", video_path,
+             "-t", str(max_duration),
+             "-c", "copy",          # ← stream copy: no decode/encode
+             out_path],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
         return out_path, True
 
     except Exception as e:
@@ -191,7 +176,7 @@ def upload_to_youtube(youtube, video_path, title="", description="", tags=None, 
         },
     }
 
-    media = MediaFileUpload(video_path, chunksize=-1, resumable=True)
+    media = MediaFileUpload(video_path, chunksize=5 * 1024 * 1024, resumable=True)  # 5 MB chunks
     req = youtube.videos().insert(part="snippet,status", body=body, media_body=media)
 
     response = None
@@ -205,14 +190,6 @@ def upload_to_youtube(youtube, video_path, title="", description="", tags=None, 
     return video_id
 
 
-def purge_temp_dir():
-    """Delete everything in TEMP_DIR to free RAM/disk after each upload."""
-    for fname in os.listdir(TEMP_DIR):
-        fpath = os.path.join(TEMP_DIR, fname)
-        try:
-            os.remove(fpath)
-        except OSError:
-            pass
 
 
 # ── Routes ───────────────────────────────────────────────────────────
@@ -443,9 +420,11 @@ def post():
 
     try:
         ydl_opts = {
-            "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+            # Download best quality that is ALREADY a single mp4 file.
+            # Avoids yt-dlp invoking FFmpeg to merge separate video+audio streams,
+            # which is the #1 cause of 100% CPU on HuggingFace.
+            "format": "best[ext=mp4]/best",
             "outtmpl": os.path.join(request_tmp, "%(id)s.%(ext)s"),
-            "merge_output_format": "mp4",
             "quiet": True,
             "no_warnings": True,
             "writeinfojson": True,
@@ -482,8 +461,8 @@ def post():
             yt_desc = meta.get("description", raw_title)
             yt_tags = meta.get("tags", [])
 
-        # ── 3. Process (pad / trim) ──────────────────────────────────
-        upload_path, is_temp = trim_and_pad(video_path, meta=meta)
+        # ── 3. Trim if over 3 min (stream copy — no re-encode) ───────
+        upload_path, is_temp = trim_if_needed(video_path, meta=meta)
 
         # ── 4. Upload ────────────────────────────────────────────────
         youtube = build("youtube", "v3", credentials=creds)
