@@ -420,14 +420,18 @@ def post():
 
     try:
         ydl_opts = {
-            # Download best quality that is ALREADY a single mp4 file.
-            # Avoids yt-dlp invoking FFmpeg to merge separate video+audio streams,
-            # which is the #1 cause of 100% CPU on HuggingFace.
-            "format": "best[ext=mp4]/best",
+            # Best separate video + audio streams, merged into mp4
+            "format": "bestvideo[ext=mp4]+bestaudio/bestvideo+bestaudio/best",
+            "merge_output_format": "mp4",
             "outtmpl": os.path.join(request_tmp, "%(id)s.%(ext)s"),
             "quiet": True,
             "no_warnings": True,
             "writeinfojson": True,
+            # Copy video stream (zero CPU), re-encode audio to AAC (fast, small)
+            # This guarantees audio is present and compatible with YouTube
+            "postprocessor_args": {
+                "merger": ["-c:v", "copy", "-c:a", "aac", "-b:a", "128k"],
+            },
         }
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
