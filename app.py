@@ -92,61 +92,122 @@ def _get_flow(state=None):
     return flow
 
 
-# ── Video helpers ────────────────────────────────────────────────────
-def trim_if_needed(video_path, meta=None, max_duration=178.0):
+# ─────────────────────────────────────────────
+# Video processing
+#
+# Strategy: check what the video actually needs,
+# then do the minimum work possible.
+#
+#   Case 1 — correct aspect ratio, has audio, under 178s
+#            → upload as-is, zero FFmpeg
+#
+#   Case 2 — needs trimming only (already 9:16, has audio)
+#            → stream copy trim, near-zero CPU
+#
+#   Case 3 — needs padding or missing audio
+#            → full re-encode (unavoidable)
+# ─────────────────────────────────────────────
+def probe_video(path):
     """
-    Only trim if video exceeds max_duration.
-    Uses -c copy (stream copy) — zero re-encoding, minimal CPU.
-    TikTok videos are already 9:16 so padding is skipped entirely.
-    Returns (path_to_upload, is_temp).
+    Run a fast FFmpeg probe (no decoding) and return
+    (duration_seconds, width, height, has_audio).
     """
-    try:
-        duration = float((meta or {}).get("duration") or 0)
+    ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+    result = subprocess.run(
+        [ffmpeg, "-i", path],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    stderr = result.stderr
 
-        if duration == 0:
-            # Fast ffprobe-style probe — no decoding
-            ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
-            probe = subprocess.run(
-                [ffmpeg_exe, "-i", video_path],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-            )
-            d_m = re.search(r"Duration: (\d+):(\d+):(\d+\.\d+)", probe.stderr)
-            if d_m:
-                duration = (int(d_m.group(1)) * 3600
-                            + int(d_m.group(2)) * 60
-                            + float(d_m.group(3)))
+    duration = 0.0
+    import re
+    d = re.search(r"Duration:\s*(\d+):(\d+):(\d+\.\d+)", stderr)
+    if d:
+        duration = int(d.group(1)) * 3600 + int(d.group(2)) * 60 + float(d.group(3))
 
-        if duration <= max_duration:
-            return video_path, False  # nothing to do — upload as-is
+    width, height = 0, 0
+    v = re.search(r"Stream #.*Video.*?,\s*(\d+)x(\d+)", stderr)
+    if v:
+        width, height = int(v.group(1)), int(v.group(2))
 
-        # Trim only — stream copy, no re-encode (uses ~1% CPU instead of 98%)
-        fd, out_path = tempfile.mkstemp(suffix=".mp4", dir=TEMP_DIR)
-        os.close(fd)
+    has_audio = "Audio:" in stderr
 
-        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
-        subprocess.run(
-            [ffmpeg_exe, "-y", "-i", video_path,
-             "-t", str(max_duration),
-             "-c", "copy",          # ← stream copy: no decode/encode
-             out_path],
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        return out_path, True
-
-    except Exception as e:
-        print(f"FFmpeg error: {e}")
-        return video_path, False
+    return duration, width, height, has_audio
 
 
-def upload_to_youtube(youtube, video_path, title="", description="", tags=None, privacy="public"):
-    if not os.path.isfile(video_path):
-        raise FileNotFoundError(f"File not found: {video_path}")
+def process_for_shorts(input_path, tmp_dir, info=None, max_duration=178.0):
+    """
+    Smart processing — only does what's actually needed.
+    Uses duration/dimensions from yt-dlp info dict when available
+    to avoid a probe call entirely.
+    """
+    ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
 
-    if not title:
-        title = os.path.splitext(os.path.basename(video_path))[0]
-    if "#Shorts" not in (description or ""):
+    # Try to get values from info dict first (free, already in memory)
+    duration = float((info or {}).get("duration") or 0)
+    width    = int((info or {}).get("width")    or 0)
+    height   = int((info or {}).get("height")   or 0)
+
+    # If info dict didn't have them, probe the file (fast, no decode)
+    if not duration or not width or not height:
+        probed_dur, probed_w, probed_h, has_audio = probe_video(input_path)
+        duration  = duration  or probed_dur
+        width     = width     or probed_w
+        height    = height    or probed_h
+    else:
+        # Still need to know if audio exists — check info dict
+        # yt-dlp sets "acodec" to "none" when there's no audio track
+        acodec    = (info or {}).get("acodec", "unknown")
+        has_audio = acodec != "none"
+
+    needs_trim    = duration > max_duration
+    needs_pad     = (height == 0) or (width / height) > (9 / 16 + 0.05)  # wider than 9:16
+    needs_reencode = needs_pad or not has_audio
+
+    fd, out = tempfile.mkstemp(suffix=".mp4", dir=tmp_dir)
+    os.close(fd)
+
+    if not needs_trim and not needs_reencode:
+        # Perfect as-is — skip FFmpeg entirely, just return original path
+        os.close(os.open(out, os.O_WRONLY))  # clean up the unused temp file
+        os.unlink(out)
+        return input_path
+
+    cmd = [ffmpeg, "-y", "-i", input_path]
+
+    if needs_trim:
+        cmd += ["-t", str(max_duration)]
+
+    if needs_reencode:
+        # Full re-encode: fix aspect ratio and/or missing audio
+        cmd += [
+            "-vf", (
+                "scale=1080:1920:force_original_aspect_ratio=decrease,"
+                "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black,"
+                "setsar=1"
+            ),
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+            "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
+            "-movflags", "+faststart",
+        ]
+    else:
+        # Trim only — stream copy, basically zero CPU
+        cmd += ["-c", "copy"]
+
+    cmd.append(out)
+    result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.decode())
+    return out
+
+
+# ─────────────────────────────────────────────
+# YouTube upload
+# ─────────────────────────────────────────────
+def upload_to_youtube(youtube, path, title, description, tags):
+    if "#Shorts" not in description:
         description = (description + " #Shorts").strip()
     if "Shorts" not in tags:
         tags.append("Shorts")
@@ -194,109 +255,224 @@ def render_page(logged_in, success=False, error=""):
     toast_html = '<div class="toast">Uploaded successfully</div>' if success else ""
     error_html = f'<div class="error">{error}</div>' if error else ""
 
-    return f"""
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Shorts Bot</title>
-        <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&display=swap" rel="stylesheet">
-        <style>
-            :root {{
-                --bg-color: #0d0f12;
-                --surface-color: rgba(255,255,255,0.05);
-                --border-color: rgba(255,255,255,0.1);
-                --primary: #f22a5c;
-                --primary-hover: #d21c48;
-                --text-main: #ffffff;
-                --text-muted: #8892b0;
-            }}
-            * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-            body {{
-                font-family: 'Inter', sans-serif;
-                background: radial-gradient(circle at top right, #1f1122 0%, var(--bg-color) 60%);
-                color: var(--text-main);
-                display: flex; align-items: center; justify-content: center;
-                min-height: 100vh; padding: 20px;
-            }}
-            .card {{
-                background: var(--surface-color);
-                border: 1px solid var(--border-color);
-                border-radius: 24px; padding: 36px 28px;
-                width: 100%; max-width: 420px;
-                backdrop-filter: blur(12px);
-                box-shadow: 0 20px 40px rgba(0,0,0,0.4);
-            }}
-            h1 {{ font-size: 26px; font-weight: 800; margin-bottom: 8px;
-                  letter-spacing: -0.5px; text-align: center; }}
-            .status-row {{ text-align: center; margin-bottom: 24px;
-                           font-size: 13px; color: {dot_color}; }}
-            .btn {{
-                background: var(--primary); color: white; border: none;
-                padding: 13px 20px; border-radius: 12px; font-size: 15px;
-                font-weight: 600; cursor: pointer; transition: all 0.2s;
-                text-decoration: none; display: inline-block;
-                width: 100%; text-align: center;
-            }}
-            .btn:hover {{ background: var(--primary-hover); transform: translateY(-2px); }}
-            .btn-login {{ background: #4285F4; }}
-            .btn-login:hover {{ background: #2b70e4; }}
-            .input-field {{
-                width: 100%; padding: 13px 16px; border-radius: 12px;
-                border: 1px solid var(--border-color);
-                background: rgba(0,0,0,0.2); color: white;
-                font-size: 14px; font-family: 'Inter', sans-serif;
-                outline: none; transition: border-color 0.2s;
-            }}
-            .input-field:focus {{ border-color: var(--primary); }}
-            .input-field::placeholder {{ color: #555; }}
-            .logout-link {{
-                color: var(--text-muted); text-decoration: none;
-                font-size: 12px; margin-top: 10px; display: inline-block;
-            }}
-            .logout-link:hover {{ color: white; }}
-            .error-box {{
-                background: rgba(255,71,87,0.1); border: 1px solid #ff4757;
-                color: #ff4757; border-radius: 12px; padding: 12px 16px;
-                font-size: 13px; margin-bottom: 16px; word-break: break-word;
-            }}
-            #loader-overlay {{
-                position: fixed; top: 0; left: 0; width: 100%; height: 100%;
-                background: rgba(13,15,18,0.92); backdrop-filter: blur(8px);
-                display: none; flex-direction: column;
-                align-items: center; justify-content: center; z-index: 1000;
-            }}
-            .spinner {{
-                width: 50px; height: 50px;
-                border: 4px solid rgba(255,255,255,0.1);
-                border-top-color: var(--primary); border-radius: 50%;
-                animation: spin 1s linear infinite; margin-bottom: 20px;
-            }}
-            @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
-            .toast {{
-                position: fixed; top: 24px; right: 24px;
-                background: rgba(46,213,115,0.15); border: 1px solid #2ed573;
-                color: #2ed573; padding: 14px 22px; border-radius: 12px;
-                font-weight: 600;
-                transform: translateX(130%);
-                animation: slideIn 0.4s ease forwards, slideOut 0.4s ease 5s forwards;
-                box-shadow: 0 10px 30px rgba(0,0,0,0.3); z-index: 999;
-            }}
-            @keyframes slideIn {{ to {{ transform: translateX(0); }} }}
-            @keyframes slideOut {{ to {{ transform: translateX(130%); }} }}
-        </style>
-    </head>
-    <body>
-        {'<div class="toast">✅ Successfully uploaded!</div>' if success else ''}
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Shorts Bot</title>
+<style>
+  *, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0; }}
 
-        <div id="loader-overlay">
-            <div class="spinner"></div>
-            <h3 style="margin-bottom:8px;">Processing Video</h3>
-            <p style="color:var(--text-muted); font-size:14px; text-align:center; max-width:80%;">
-                Downloading, converting, and uploading to YouTube…<br>Please wait!
-            </p>
-        </div>
+  body {{
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    background: #0e0e0e;
+    color: #e8e8e8;
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+  }}
+
+  .wrap {{
+    width: 100%;
+    max-width: 360px;
+  }}
+
+  .title {{
+    font-size: 17px;
+    font-weight: 600;
+    color: #fff;
+    margin-bottom: 6px;
+  }}
+
+  .status {{
+    font-size: 12px;
+    color: {status_color};
+    margin-bottom: 28px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }}
+  .status::before {{
+    content: "";
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: {status_color};
+    display: inline-block;
+    flex-shrink: 0;
+  }}
+
+  .input-row {{
+    display: flex;
+    gap: 8px;
+    margin-bottom: 10px;
+  }}
+
+  input[type=url] {{
+    flex: 1;
+    background: #1a1a1a;
+    border: 1px solid #2a2a2a;
+    border-radius: 8px;
+    color: #e8e8e8;
+    font-size: 14px;
+    padding: 11px 14px;
+    outline: none;
+    transition: border-color 0.15s;
+    min-width: 0;
+  }}
+  input[type=url]:focus {{ border-color: #555; }}
+  input[type=url]::placeholder {{ color: #3a3a3a; }}
+
+  .paste-btn {{
+    background: #1a1a1a;
+    border: 1px solid #2a2a2a;
+    border-radius: 8px;
+    color: #666;
+    font-size: 16px;
+    padding: 0 13px;
+    cursor: pointer;
+    transition: color 0.15s;
+    flex-shrink: 0;
+  }}
+  .paste-btn:hover {{ color: #e8e8e8; }}
+
+  .post-btn {{
+    width: 100%;
+    background: #e8e8e8;
+    color: #0e0e0e;
+    border: none;
+    border-radius: 8px;
+    font-size: 14px;
+    font-weight: 600;
+    padding: 12px;
+    cursor: pointer;
+    transition: background 0.15s;
+    display: block;
+  }}
+  .post-btn:hover {{ background: #fff; }}
+
+  .login-btn {{
+    width: 100%;
+    background: transparent;
+    border: 1px solid #2a2a2a;
+    border-radius: 8px;
+    color: #e8e8e8;
+    font-size: 14px;
+    font-weight: 500;
+    padding: 12px;
+    cursor: pointer;
+    text-decoration: none;
+    display: block;
+    text-align: center;
+    transition: border-color 0.15s;
+  }}
+  .login-btn:hover {{ border-color: #555; }}
+
+  .signout {{
+    display: inline-block;
+    margin-top: 14px;
+    font-size: 12px;
+    color: #3a3a3a;
+    text-decoration: none;
+    transition: color 0.15s;
+  }}
+  .signout:hover {{ color: #777; }}
+
+  .error {{
+    font-size: 13px;
+    color: #f87171;
+    margin-bottom: 16px;
+    line-height: 1.5;
+    word-break: break-word;
+  }}
+
+  #overlay {{
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: #0e0e0e;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 20px;
+    z-index: 100;
+  }}
+
+  .steps {{
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    width: 180px;
+  }}
+
+  .step {{
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    font-size: 14px;
+    color: #2a2a2a;
+    transition: color 0.3s;
+  }}
+  .step.active {{ color: #e8e8e8; }}
+  .step.done   {{ color: #4ade80; }}
+
+  .step-dot {{
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: #2a2a2a;
+    flex-shrink: 0;
+    transition: background 0.3s;
+  }}
+  .step.active .step-dot {{
+    background: #e8e8e8;
+    animation: pulse 1.4s ease infinite;
+  }}
+  .step.done .step-dot {{ background: #4ade80; }}
+
+  @keyframes pulse {{
+    0%, 100% {{ box-shadow: 0 0 0 3px rgba(232,232,232,0.12); }}
+    50%       {{ box-shadow: 0 0 0 6px rgba(232,232,232,0.04); }}
+  }}
+
+  .toast {{
+    position: fixed;
+    bottom: 24px;
+    left: 50%;
+    transform: translateX(-50%) translateY(60px);
+    background: #1a1a1a;
+    border: 1px solid #2a2a2a;
+    color: #4ade80;
+    padding: 10px 20px;
+    border-radius: 20px;
+    font-size: 13px;
+    font-weight: 500;
+    opacity: 0;
+    white-space: nowrap;
+    animation: toast-in 0.3s ease 0.1s forwards, toast-out 0.3s ease 3.5s forwards;
+  }}
+  @keyframes toast-in {{
+    to {{ opacity: 1; transform: translateX(-50%) translateY(0); }}
+  }}
+  @keyframes toast-out {{
+    to {{ opacity: 0; transform: translateX(-50%) translateY(60px); }}
+  }}
+</style>
+</head>
+<body>
+
+{toast_html}
+
+<div id="overlay">
+  <div class="steps">
+    <div class="step" id="s1"><div class="step-dot"></div>Downloading</div>
+    <div class="step" id="s2"><div class="step-dot"></div>Converting</div>
+    <div class="step" id="s3"><div class="step-dot"></div>Uploading</div>
+  </div>
+</div>
 
 <div class="wrap">
   <div class="title">Shorts Bot</div>
@@ -305,24 +481,58 @@ def render_page(logged_in, success=False, error=""):
   {body_html}
 </div>
 
-        <script>
-        function submitTikTok() {{
-            const url = document.getElementById('tiktok-url').value.trim();
-            if (!url) {{ alert('Please paste a TikTok URL first.'); return; }}
-            document.getElementById('loader-overlay').style.display = 'flex';
-            const form = document.createElement('form');
-            form.method = 'POST';
-            form.action = '/post';
-            const i = document.createElement('input');
-            i.type = 'hidden'; i.name = 'url'; i.value = url;
-            form.appendChild(i);
-            document.body.appendChild(form);
-            form.submit();
-        }}
-        </script>
-    </body>
-    </html>
-    """
+<script>
+function doPaste() {{
+  navigator.clipboard.readText().then(t => document.getElementById("url").value = t.trim());
+}}
+
+function doSubmit() {{
+  const url = document.getElementById("url").value.trim();
+  if (!url) return;
+
+  document.getElementById("overlay").style.display = "flex";
+  activate("s1", 0);
+  activate("s2", 6000);
+  activate("s3", 18000);
+
+  const form = document.createElement("form");
+  form.method = "POST";
+  form.action = "/post";
+  const inp = document.createElement("input");
+  inp.type = "hidden"; inp.name = "url"; inp.value = url;
+  form.appendChild(inp);
+  document.body.appendChild(form);
+  form.submit();
+}}
+
+function activate(id, delay) {{
+  setTimeout(() => {{
+    document.querySelectorAll(".step").forEach(s => {{
+      if (s.id === id) {{
+        s.classList.add("active");
+      }} else if (s.classList.contains("active")) {{
+        s.classList.remove("active");
+        s.classList.add("done");
+      }}
+    }});
+  }}, delay);
+}}
+</script>
+</body>
+</html>"""
+
+
+# ─────────────────────────────────────────────
+# Routes
+# ─────────────────────────────────────────────
+@app.route("/")
+def index():
+    creds = load_credentials()
+    return render_page(
+        logged_in=creds is not None and creds.valid,
+        success=bool(request.args.get("success")),
+        error=request.args.get("error", ""),
+    )
 
 
 @app.route("/login")
@@ -372,16 +582,11 @@ def post():
     if not creds or not creds.valid:
         return redirect(url_for("login"))
 
-    # ── 1. Download ──────────────────────────────────────────────────
-    # Use a fresh isolated temp folder for this single request
-    request_tmp = tempfile.mkdtemp(dir=TEMP_DIR)
-    video_path = None
-    json_path = None
-
+    tmp = tempfile.mkdtemp(dir=TEMP_DIR)
     try:
-        ydl_opts = {
-            # Best separate video + audio streams, merged into mp4
-            "format": "bestvideo[ext=mp4]+bestaudio/bestvideo+bestaudio/best",
+        # 1. Download
+        with yt_dlp.YoutubeDL({
+            "format": "bestvideo+bestaudio/best",
             "merge_output_format": "mp4",
             "outtmpl": os.path.join(tmp, "%(id)s.%(ext)s"),
             "quiet": True,
@@ -398,24 +603,14 @@ def post():
         if not video_path:
             raise FileNotFoundError("Download produced no video file.")
 
-        # ── 2. Read metadata ─────────────────────────────────────────
-        meta = None
-        yt_title = video_id
-        yt_desc = ""
-        yt_tags = []
+        # 3. Metadata from info dict (no disk read)
+        raw_title   = info.get("title") or ""
+        title       = (raw_title[:90] + "…") if len(raw_title) > 95 else (raw_title or "TikTok Video")
+        description = info.get("description") or raw_title or ""
+        tags        = list(info.get("tags") or [])
 
-        if json_path and os.path.exists(json_path):
-            with open(json_path, "r", encoding="utf-8") as f:
-                meta = json.load(f)
-            raw_title = meta.get("title", "")
-            yt_title = (raw_title[:90] + "…") if len(raw_title) > 95 else raw_title
-            if not yt_title:
-                yt_title = "TikTok Video"
-            yt_desc = meta.get("description", raw_title)
-            yt_tags = meta.get("tags", [])
-
-        # ── 3. Trim if over 3 min (stream copy — no re-encode) ───────
-        upload_path, is_temp = trim_if_needed(video_path, meta=meta)
+        # 4. Smart process — only re-encodes if actually needed
+        processed = process_for_shorts(video_path, tmp, info=info)
 
         # 5. Upload
         yt = build("youtube", "v3", credentials=creds)
