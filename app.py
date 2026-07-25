@@ -27,6 +27,7 @@ app.secret_key = os.environ.get("FLASK_SECRET_KEY", "shorts-secret")
 app.permanent_session_lifetime = timedelta(days=90)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
 
+
 DEV = os.environ.get("FLASK_ENV") == "development"
 if DEV:
     os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"
