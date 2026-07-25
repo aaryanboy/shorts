@@ -14,6 +14,7 @@ This web application automates the process of fetching videos (e.g., from TikTok
 
 ## Local Development
 
+
 ### Setup
 
 1. Install dependencies:
